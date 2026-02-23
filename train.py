@@ -8,8 +8,10 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -23,8 +25,13 @@ from models import build_model
 # ═══════════════════════════════════════════════════════════════════
 
 
-def seed_everything(seed: int) -> None:
-    """Set seed for reproducibility across random, numpy, and torch."""
+def seed_everything(seed: int, rank: int = 0) -> None:
+    """Set seed for reproducibility across random, numpy, and torch.
+
+    In DDP, each rank adds its rank to the seed so augmentations differ
+    across workers while remaining reproducible.
+    """
+    seed = seed + rank
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -32,6 +39,87 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def setup_distributed(args) -> tuple:
+    """Initialize the distributed process group.
+
+    Reads RANK, LOCAL_RANK, WORLD_SIZE from environment (set by torchrun).
+
+    Returns:
+        (rank, local_rank, world_size)
+    """
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend=getattr(args, "dist_backend", "nccl"),
+        rank=rank,
+        world_size=world_size,
+    )
+    dist.barrier()
+    return rank, local_rank, world_size
+
+
+def cleanup_distributed():
+    """Destroy the distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(args) -> bool:
+    """Return True if this is rank 0 or non-distributed training."""
+    if not getattr(args, "distributed", False):
+        return True
+    return getattr(args, "_rank", 0) == 0
+
+
+def print_rank0(msg, args):
+    """Print only on the main process."""
+    if is_main_process(args):
+        print(msg)
+
+
+def gather_predictions(local_probs: torch.Tensor, local_labels: torch.Tensor) -> tuple:
+    """Gather predictions and labels from all ranks.
+
+    Handles variable sizes across ranks by padding to the max size.
+
+    Args:
+        local_probs: Tensor of shape (N_local,) on the current device.
+        local_labels: Tensor of shape (N_local,) on the current device.
+
+    Returns:
+        (all_probs, all_labels) gathered across all ranks.
+    """
+    world_size = dist.get_world_size()
+
+    local_size = torch.tensor([local_probs.size(0)], dtype=torch.long, device=local_probs.device)
+    all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(all_sizes, local_size)
+
+    max_size = max(s.item() for s in all_sizes)
+
+    padded_probs = torch.zeros(max_size, device=local_probs.device, dtype=local_probs.dtype)
+    padded_probs[:local_probs.size(0)] = local_probs
+    padded_labels = torch.zeros(max_size, device=local_labels.device, dtype=local_labels.dtype)
+    padded_labels[:local_labels.size(0)] = local_labels
+
+    gathered_probs = [torch.zeros_like(padded_probs) for _ in range(world_size)]
+    gathered_labels = [torch.zeros_like(padded_labels) for _ in range(world_size)]
+    dist.all_gather(gathered_probs, padded_probs)
+    dist.all_gather(gathered_labels, padded_labels)
+
+    all_probs_list = []
+    all_labels_list = []
+    for i in range(world_size):
+        n = all_sizes[i].item()
+        all_probs_list.append(gathered_probs[i][:n])
+        all_labels_list.append(gathered_labels[i][:n])
+
+    return torch.cat(all_probs_list), torch.cat(all_labels_list)
 
 
 def _wrap_mamba_fp32(model: nn.Module) -> None:
@@ -192,7 +280,8 @@ def train_one_epoch(
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
-    pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False)
+    pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False,
+                disable=not is_main_process(args))
     for images, labels, _metadata in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -243,7 +332,8 @@ def validate(
     all_probs = []
     all_labels = []
 
-    pbar = tqdm(loader, desc=f"Val   Epoch {epoch}", leave=False)
+    pbar = tqdm(loader, desc=f"Val   Epoch {epoch}", leave=False,
+                disable=not is_main_process(args))
     with torch.no_grad():
         for images, labels, _metadata in pbar:
             images = images.to(device, non_blocking=True)
@@ -266,7 +356,27 @@ def validate(
 
             pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", acc=f"{acc_meter.avg:.4f}")
 
-    results = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
+    # In DDP: gather predictions from all ranks for correct global metrics
+    local_probs = torch.cat(all_probs)
+    local_labels = torch.cat(all_labels)
+
+    if getattr(args, "distributed", False) and dist.is_initialized():
+        global_probs, global_labels = gather_predictions(
+            local_probs.to(device), local_labels.to(device)
+        )
+        global_probs = global_probs.cpu()
+        global_labels = global_labels.cpu()
+
+        total_correct = (global_probs >= 0.5).long().eq(global_labels).sum().item()
+        total_samples = global_labels.size(0)
+        results = {
+            "loss": loss_meter.avg,
+            "accuracy": total_correct / max(total_samples, 1),
+        }
+    else:
+        global_probs = local_probs
+        global_labels = local_labels
+        results = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
 
     try:
         from sklearn.metrics import (
@@ -276,8 +386,8 @@ def validate(
             roc_auc_score,
         )
 
-        all_probs_np = torch.cat(all_probs).numpy()
-        all_labels_np = torch.cat(all_labels).numpy()
+        all_probs_np = global_probs.numpy()
+        all_labels_np = global_labels.numpy()
         all_preds_np = (all_probs_np >= 0.5).astype(int)
         results["auc"] = roc_auc_score(all_labels_np, all_probs_np)
         results["f1"] = f1_score(all_labels_np, all_preds_np)
@@ -304,13 +414,15 @@ def save_checkpoint(
     best_val_acc: float,
     args,
 ) -> None:
-    """Save training checkpoint to disk."""
+    """Save training checkpoint to disk. In DDP, call only on rank 0."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     args_dict = vars(args) if hasattr(args, "__dict__") else dict(args)
     args_dict["tb_log_dir"] = getattr(args, "_tb_log_dir", args_dict.get("tb_log_dir", ""))
+    # Unwrap DDP model for portable checkpoints
+    model_to_save = model.module if hasattr(model, "module") else model
     checkpoint = {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": model_to_save.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -341,33 +453,71 @@ def main():
             "Separate mode training is not yet supported."
         )
 
-    # Reproducibility
-    seed_everything(args.seed)
+    # Auto-detect distributed from torchrun environment
+    if "RANK" in os.environ and "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        args.distributed = True
+
+    # Setup distributed
+    if args.distributed:
+        rank, local_rank, world_size = setup_distributed(args)
+        args._rank = rank
+        args._local_rank = local_rank
+        args._world_size = world_size
+    else:
+        args._rank = 0
+        args._local_rank = 0
+        args._world_size = 1
+
+    # Reproducibility (rank offset for per-worker augmentation diversity)
+    seed_everything(args.seed, rank=args._rank)
 
     # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    if args.distributed:
+        device = torch.device(f"cuda:{args._local_rank}")
+        torch.cuda.set_device(device)
     else:
-        print("WARNING: CUDA not available, disabling AMP")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print_rank0(f"Device: {device}", args)
+    if device.type == "cuda":
+        print_rank0(f"  GPU: {torch.cuda.get_device_name(device)}", args)
+        if args.distributed:
+            print_rank0(f"  World size: {args._world_size}", args)
+    else:
+        print_rank0("WARNING: CUDA not available, disabling AMP", args)
         args.amp = False
 
     # Data
-    print("Building data loaders...")
+    print_rank0("Building data loaders...", args)
     train_loader, val_loader = build_train_val_loaders(args)
     steps_per_epoch = len(train_loader)
-    print(f"  Steps per epoch: {steps_per_epoch}")
+    print_rank0(f"  Steps per epoch: {steps_per_epoch}", args)
 
     # Model
-    print("Building model...")
+    print_rank0("Building model...", args)
     model = build_model(args).to(device)
     if args.amp:
         _wrap_mamba_fp32(model)
+
+    # SyncBatchNorm (optional, before DDP wrap)
+    if args.distributed and getattr(args, "sync_bn", False):
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        print_rank0("  Converted BatchNorm -> SyncBatchNorm", args)
+
+    # Wrap model with DDP
+    if args.distributed:
+        model = DDP(model, device_ids=[args._local_rank])
+        print_rank0("  Wrapped model with DistributedDataParallel", args)
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Total params: {total_params:,}")
-    print(f"  Trainable params: {trainable_params:,}")
+    print_rank0(f"  Total params: {total_params:,}", args)
+    print_rank0(f"  Trainable params: {trainable_params:,}", args)
+
+    # Linear LR scaling (before optimizer build)
+    if args.distributed and getattr(args, "scale_lr", False):
+        original_lr = args.lr
+        args.lr = args.lr * args._world_size
+        print_rank0(f"  LR scaled: {original_lr} -> {args.lr} (x{args._world_size})", args)
 
     # Loss, optimizer, scheduler, scaler
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -378,19 +528,24 @@ def main():
     # Resume
     start_epoch = 0
     best_val_acc = 0.0
+    ckpt = None
     if args.resume:
-        print(f"Resuming from: {args.resume}")
+        print_rank0(f"Resuming from: {args.resume}", args)
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        if args.distributed:
+            model.module.load_state_dict(ckpt["model"])
+        else:
+            model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_val_acc = ckpt.get("best_val_acc", 0.0)
-        print(f"  Resumed at epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
+        print_rank0(f"  Resumed at epoch {start_epoch}, best_val_acc={best_val_acc:.4f}", args)
 
-    # TensorBoard
-    if args.resume and ckpt.get("args", {}).get("tb_log_dir"):
+    # TensorBoard — only rank 0
+    writer = None
+    if args.resume and ckpt is not None and ckpt.get("args", {}).get("tb_log_dir"):
         tb_log_dir = ckpt["args"]["tb_log_dir"]
         run_name = os.path.basename(tb_log_dir)
     else:
@@ -400,9 +555,11 @@ def main():
     args._tb_log_dir = tb_log_dir
     # Mirror run_name into save_dir so checkpoints are per-trial
     args.save_dir = os.path.join(args.save_dir, run_name)
-    writer = SummaryWriter(log_dir=tb_log_dir)
-    hparam_str = "\n".join(f"  {k}: {v}" for k, v in sorted(vars(args).items()))
-    writer.add_text("hyperparameters", hparam_str, 0)
+
+    if is_main_process(args):
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        hparam_str = "\n".join(f"  {k}: {v}" for k, v in sorted(vars(args).items()))
+        writer.add_text("hyperparameters", hparam_str, 0)
 
     # Early stopping
     early_stopping = EarlyStopping(patience=args.early_stopping_patience)
@@ -411,14 +568,21 @@ def main():
         early_stopping.best_epoch = start_epoch - 1
 
     # Training loop
-    os.makedirs(args.save_dir, exist_ok=True)
-    print(f"\nStarting training for {args.epochs} epochs...")
-    print(f"  Checkpoints: {args.save_dir}")
-    print(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}")
+    if is_main_process(args):
+        os.makedirs(args.save_dir, exist_ok=True)
+    print_rank0(f"\nStarting training for {args.epochs} epochs...", args)
+    print_rank0(f"  Checkpoints: {args.save_dir}", args)
+    print_rank0(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}", args)
 
     epoch = max(start_epoch - 1, 0)
     for epoch in range(start_epoch, args.epochs):
         epoch_start = time.time()
+
+        # Set epoch on DistributedSampler for proper shuffling
+        if args.distributed and hasattr(train_loader, "sampler"):
+            sampler = train_loader.sampler
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
         # Train
         train_metrics = train_one_epoch(
@@ -426,80 +590,107 @@ def main():
             scaler, device, epoch, args,
         )
 
-        writer.add_scalar("train/loss", train_metrics["loss"], epoch)
-        writer.add_scalar("train/accuracy", train_metrics["accuracy"], epoch)
-        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+        if writer is not None:
+            writer.add_scalar("train/loss", train_metrics["loss"], epoch)
+            writer.add_scalar("train/accuracy", train_metrics["accuracy"], epoch)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
 
         # Validate
         val_metrics = None
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
             val_metrics = validate(model, val_loader, criterion, device, epoch, args)
 
-            writer.add_scalar("val/loss", val_metrics["loss"], epoch)
-            writer.add_scalar("val/accuracy", val_metrics["accuracy"], epoch)
-            if "auc" in val_metrics:
-                writer.add_scalar("val/auc", val_metrics["auc"], epoch)
-            if "f1" in val_metrics:
-                writer.add_scalar("val/f1", val_metrics["f1"], epoch)
-            if "precision" in val_metrics:
-                writer.add_scalar("val/precision", val_metrics["precision"], epoch)
-            if "recall" in val_metrics:
-                writer.add_scalar("val/recall", val_metrics["recall"], epoch)
+            if writer is not None:
+                writer.add_scalar("val/loss", val_metrics["loss"], epoch)
+                writer.add_scalar("val/accuracy", val_metrics["accuracy"], epoch)
+                if "auc" in val_metrics:
+                    writer.add_scalar("val/auc", val_metrics["auc"], epoch)
+                if "f1" in val_metrics:
+                    writer.add_scalar("val/f1", val_metrics["f1"], epoch)
+                if "precision" in val_metrics:
+                    writer.add_scalar("val/precision", val_metrics["precision"], epoch)
+                if "recall" in val_metrics:
+                    writer.add_scalar("val/recall", val_metrics["recall"], epoch)
 
             improved = early_stopping.step(val_metrics["accuracy"], epoch)
-            if improved:
+            if improved and is_main_process(args):
                 save_checkpoint(
                     os.path.join(args.save_dir, "best.pth"),
                     model, optimizer, scheduler, scaler, epoch,
                     val_metrics["accuracy"], args,
                 )
 
-        # Periodic checkpoint
-        if (epoch + 1) % args.save_every == 0:
+        # Periodic checkpoint (rank 0 only)
+        if (epoch + 1) % args.save_every == 0 and is_main_process(args):
             save_checkpoint(
                 os.path.join(args.save_dir, f"epoch_{epoch}.pth"),
                 model, optimizer, scheduler, scaler, epoch,
                 early_stopping.best_score, args,
             )
 
-        writer.flush()
+        if writer is not None:
+            writer.flush()
 
-        # Epoch summary
+        # Epoch summary (rank 0 only)
         elapsed = time.time() - epoch_start
-        summary = f"Epoch {epoch}/{args.epochs - 1} ({elapsed:.1f}s)"
-        summary += f" | train_loss={train_metrics['loss']:.4f}"
-        summary += f" train_acc={train_metrics['accuracy']:.4f}"
-        if val_metrics:
-            summary += f" | val_loss={val_metrics['loss']:.4f}"
-            summary += f" val_acc={val_metrics['accuracy']:.4f}"
-            if "auc" in val_metrics:
-                summary += f" val_auc={val_metrics['auc']:.4f}"
-            if "precision" in val_metrics:
-                summary += f" val_prec={val_metrics['precision']:.4f}"
-            if "recall" in val_metrics:
-                summary += f" val_rec={val_metrics['recall']:.4f}"
-        summary += f" | lr={optimizer.param_groups[0]['lr']:.2e}"
-        if early_stopping.enabled:
-            summary += f" | patience={early_stopping.counter}/{early_stopping.patience}"
-        print(summary)
+        if is_main_process(args):
+            summary = f"Epoch {epoch}/{args.epochs - 1} ({elapsed:.1f}s)"
+            summary += f" | train_loss={train_metrics['loss']:.4f}"
+            summary += f" train_acc={train_metrics['accuracy']:.4f}"
+            if val_metrics:
+                summary += f" | val_loss={val_metrics['loss']:.4f}"
+                summary += f" val_acc={val_metrics['accuracy']:.4f}"
+                if "auc" in val_metrics:
+                    summary += f" val_auc={val_metrics['auc']:.4f}"
+                if "precision" in val_metrics:
+                    summary += f" val_prec={val_metrics['precision']:.4f}"
+                if "recall" in val_metrics:
+                    summary += f" val_rec={val_metrics['recall']:.4f}"
+            summary += f" | lr={optimizer.param_groups[0]['lr']:.2e}"
+            if early_stopping.enabled:
+                summary += f" | patience={early_stopping.counter}/{early_stopping.patience}"
+            print(summary)
 
-        if early_stopping.should_stop:
-            print(f"\nEarly stopping at epoch {epoch}.")
-            print(f"  Best val accuracy: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})")
-            break
+        # Early stopping: broadcast decision from rank 0 to all ranks
+        if args.distributed:
+            stop_flag = torch.tensor(
+                [1 if early_stopping.should_stop else 0],
+                dtype=torch.int, device=device,
+            )
+            dist.broadcast(stop_flag, src=0)
+            if stop_flag.item() == 1:
+                print_rank0(f"\nEarly stopping at epoch {epoch}.", args)
+                print_rank0(
+                    f"  Best val accuracy: {early_stopping.best_score:.4f} "
+                    f"(epoch {early_stopping.best_epoch})", args,
+                )
+                break
+        else:
+            if early_stopping.should_stop:
+                print(f"\nEarly stopping at epoch {epoch}.")
+                print(f"  Best val accuracy: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})")
+                break
 
-    # Save final checkpoint
-    save_checkpoint(
-        os.path.join(args.save_dir, "last.pth"),
-        model, optimizer, scheduler, scaler,
-        epoch, early_stopping.best_score, args,
-    )
+    # Save final checkpoint (rank 0 only)
+    if is_main_process(args):
+        save_checkpoint(
+            os.path.join(args.save_dir, "last.pth"),
+            model, optimizer, scheduler, scaler,
+            epoch, early_stopping.best_score, args,
+        )
 
-    writer.close()
-    print(f"\nTraining complete.")
-    print(f"  Best val accuracy: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})")
-    print(f"  Checkpoints: {args.save_dir}")
-    print(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}")
+    if writer is not None:
+        writer.close()
+
+    print_rank0(f"\nTraining complete.", args)
+    print_rank0(f"  Best val accuracy: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})", args)
+    if is_main_process(args):
+        print(f"  Checkpoints: {args.save_dir}")
+        print(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}")
+
+    # Cleanup distributed
+    if args.distributed:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

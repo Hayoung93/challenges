@@ -36,6 +36,9 @@ DEFAULTS = {
 
     # Distributed
     "distributed": False,
+    "dist_backend": "nccl",
+    "scale_lr": False,
+    "sync_bn": False,
     "seed": 42,
 
     # Model
@@ -107,6 +110,15 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--distributed", action="store_true", default=DEFAULTS["distributed"],
                     help="Enable distributed data parallel training")
     g.add_argument("--no_distributed", dest="distributed", action="store_false")
+    g.add_argument("--dist_backend", type=str, default=DEFAULTS["dist_backend"],
+                    choices=["nccl", "gloo"],
+                    help="Backend for torch.distributed (nccl for GPU, gloo for CPU)")
+    g.add_argument("--scale_lr", action="store_true", default=DEFAULTS["scale_lr"],
+                    help="Scale LR linearly by world_size")
+    g.add_argument("--no_scale_lr", dest="scale_lr", action="store_false")
+    g.add_argument("--sync_bn", action="store_true", default=DEFAULTS["sync_bn"],
+                    help="Convert BatchNorm layers to SyncBatchNorm for DDP")
+    g.add_argument("--no_sync_bn", dest="sync_bn", action="store_false")
     g.add_argument("--amp", action="store_true", default=DEFAULTS["amp"],
                     help="Enable automatic mixed precision")
     g.add_argument("--no_amp", dest="amp", action="store_false")

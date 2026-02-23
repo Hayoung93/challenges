@@ -158,6 +158,18 @@ pip install scikit-learn   # 선택 사항
 - `"backbone."` prefix가 있는 checkpoint
 - Raw `state_dict`
 
+### DDP 학습 후 추론
+
+DDP로 학습된 checkpoint는 `"module."` prefix 없이 저장되므로, 단일 GPU에서 바로 추론 가능하다.
+
+```bash
+# DDP 학습
+torchrun --nproc_per_node=4 train.py --batch_size 32
+
+# 단일 GPU 추론 (변경 없이 사용)
+python test.py --checkpoint_path ./checkpoints/best.pth
+```
+
 ## Args 레퍼런스
 
 ### Test 전용 옵션

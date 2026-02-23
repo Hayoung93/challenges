@@ -230,7 +230,59 @@ pip install scikit-learn   # 선택 사항
 | `eval_every` | `int` | `1` | Validation 실행 간격 (epoch) |
 | `resume` | `str` | `""` | 학습 재개용 checkpoint 경로 |
 
+### 분산 학습
+
+| 필드 | 타입 | 기본값 | 설명 |
+|------|------|--------|------|
+| `distributed` | `bool` | `False` | DDP 활성화 (`torchrun` 시 자동) |
+| `dist_backend` | `str` | `"nccl"` | `"nccl"` (GPU) 또는 `"gloo"` (CPU) |
+| `scale_lr` | `bool` | `False` | Linear LR scaling (lr × world_size) |
+| `sync_bn` | `bool` | `False` | SyncBatchNorm 변환 |
+
 데이터, 모델 관련 옵션은 [dataloader.md](dataloader.md) 참조.
+
+## 분산 학습 (Multi-GPU DDP)
+
+`torchrun`으로 2개 이상의 GPU에서 DistributedDataParallel 학습을 수행한다.
+
+### 실행 방법
+
+```bash
+# 2 GPU
+torchrun --nproc_per_node=2 train.py --batch_size 32
+
+# 4 GPU + LR scaling (lr × world_size)
+torchrun --nproc_per_node=4 train.py --batch_size 32 --lr 1e-4 --scale_lr
+
+# 특정 GPU 지정
+CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py
+
+# 단일 GPU (기존과 동일)
+python train.py
+```
+
+### DDP 동작 방식
+
+- `batch_size`는 GPU당 크기. 4 GPU × batch_size 32 = 유효 배치 128
+- `torchrun`이 `RANK/LOCAL_RANK/WORLD_SIZE` 환경변수를 설정하면 자동으로 DDP 모드 활성화
+- Rank 0만 checkpoint 저장, TensorBoard 로깅, 콘솔 출력 수행
+- Checkpoint는 DDP prefix 없이 저장되어 단일 GPU에서도 로드 가능
+- `--scale_lr` 사용 시 learning rate가 world_size 배로 자동 스케일링 (Linear Scaling Rule)
+- `--sync_bn` 사용 시 BatchNorm이 SyncBatchNorm으로 변환되어 GPU 간 통계 동기화
+
+### Multi-node 학습
+
+```bash
+# Node 0:
+torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 \
+    --master_addr=10.0.0.1 --master_port=29500 \
+    train.py --batch_size 32
+
+# Node 1:
+torchrun --nnodes=2 --nproc_per_node=4 --node_rank=1 \
+    --master_addr=10.0.0.1 --master_port=29500 \
+    train.py --batch_size 32
+```
 
 ## 주의사항
 
