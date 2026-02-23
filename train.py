@@ -34,6 +34,30 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def _wrap_mamba_fp32(model: nn.Module) -> None:
+    """Force MambaVisionMixer layers to run in fp32 under AMP.
+
+    Disables autocast inside each MambaVisionMixer.forward() so that
+    selective-scan operations execute in fp32, preventing fp16 overflow.
+    Other layers (Conv, Attention) remain in fp16.
+    """
+    patched = 0
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "MambaVisionMixer":
+            original_forward = module.forward
+
+            def _make_fp32_forward(fwd):
+                def _fp32_forward(hidden_states):
+                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                        return fwd(hidden_states.float())
+                return _fp32_forward
+
+            module.forward = _make_fp32_forward(original_forward)
+            patched += 1
+    if patched:
+        print(f"  Wrapped {patched} MambaVisionMixer layer(s) to fp32")
+
+
 class AverageMeter:
     """Computes and stores a running average."""
 
@@ -338,6 +362,8 @@ def main():
     # Model
     print("Building model...")
     model = build_model(args).to(device)
+    if args.amp:
+        _wrap_mamba_fp32(model)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total params: {total_params:,}")
