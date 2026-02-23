@@ -155,6 +155,19 @@ def print_metrics(metrics, subset_name="val"):
 # ═══════════════════════════════════════════════════════════════════
 
 
+def get_log_name(checkpoint_path):
+    """Extract a log/run name from a checkpoint path.
+
+    If the checkpoint lives in a per-run subdirectory (e.g.
+    ``checkpoints/run_name/best.pth``), returns the subdirectory name.
+    Otherwise falls back to the checkpoint filename stem (e.g. ``best``).
+    """
+    parent = os.path.basename(os.path.dirname(os.path.abspath(checkpoint_path)))
+    if parent and parent != "checkpoints":
+        return parent
+    return os.path.splitext(os.path.basename(checkpoint_path))[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description="GenAI Image Detection - Inference")
     add_data_args(parser)
@@ -171,11 +184,16 @@ def main():
     if device.type != "cuda":
         args.amp = False
 
+    # Resolve output directory: {output_dir}/{log_name}/
+    log_name = get_log_name(args.checkpoint_path)
+    args.output_dir = os.path.join(args.output_dir, log_name)
+
     # Model
     print(f"Model: {args.model_name}")
     print(f"Checkpoint: {args.checkpoint_path}")
     print(f"Device: {device}")
     print(f"AMP: {args.amp}, TTA: {args.tta}")
+    print(f"Output: {args.output_dir}")
 
     model = build_model(args).to(device)
     model.eval()
