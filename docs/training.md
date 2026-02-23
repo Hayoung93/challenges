@@ -40,7 +40,10 @@ python train.py --scheduler cosine --warmup_epochs 3
 python train.py --scheduler step --step_lr_size 10 --step_lr_decay 0.1
 
 # 데이터 augmentation 강도
-python train.py --augmentation strong
+python train.py --augmentation default             # 기본 (RandomCrop, HFlip, ColorJitter)
+python train.py --augmentation strong              # 강한 geometric/color augmentation
+python train.py --augmentation genai               # GenAI artifact augmentation (JPEG압축, resize artifact, noise)
+python train.py --augmentation genai_curriculum    # GenAI augmentation + 점진적 강도 증가 (curricular)
 
 # backbone 고정 (head만 학습)
 python train.py --freeze_backbone --lr 1e-3 --epochs 10

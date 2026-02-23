@@ -28,7 +28,7 @@ DEFAULTS = {
     # Transforms
     "image_size": 224,
     "resize_size": 256,
-    "augmentation": "default",  # "none", "default", "strong"
+    "augmentation": "default",  # "none", "default", "strong", "genai", "genai_curriculum"
 
     # Dragon-specific
     "dragon_lru_capacity": 4,
@@ -103,7 +103,7 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--image_size", type=int, default=DEFAULTS["image_size"])
     g.add_argument("--resize_size", type=int, default=DEFAULTS["resize_size"])
     g.add_argument("--augmentation", type=str, default=DEFAULTS["augmentation"],
-                    choices=["none", "default", "strong"])
+                    choices=["none", "default", "strong", "genai", "genai_curriculum"])
     g.add_argument("--dragon_lru_capacity", type=int, default=DEFAULTS["dragon_lru_capacity"])
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])

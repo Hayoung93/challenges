@@ -574,9 +574,16 @@ def main():
     print_rank0(f"  Checkpoints: {args.save_dir}", args)
     print_rank0(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}", args)
 
+    # Curricular augmentation epoch state (None when not using genai_curriculum)
+    _epoch_state = getattr(train_loader, "_epoch_state", None)
+
     epoch = max(start_epoch - 1, 0)
     for epoch in range(start_epoch, args.epochs):
         epoch_start = time.time()
+
+        # Update curriculum augmentation epoch
+        if _epoch_state is not None:
+            _epoch_state.value = epoch
 
         # Set epoch on DistributedSampler for proper shuffling
         if args.distributed and hasattr(train_loader, "sampler"):

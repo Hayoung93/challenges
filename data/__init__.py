@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 from typing import Dict, List, Tuple, Union
 
@@ -9,18 +10,21 @@ from .dragon import DragonArrowDataset
 from .ntire import NTIREDataset, NTIRETestDataset
 from .transforms import get_train_transform, get_val_transform
 
-def build_dataset(name: str, args, split: str = "train") -> BaseGenAIDataset:
+def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> BaseGenAIDataset:
     """Build a single dataset by name.
 
     Args:
         name: ``"dragon"`` or ``"ntire"``.
         args: Namespace with config attributes (see ``config.py``).
         split: ``"train"`` or ``"val"``.
+        epoch_state: ``multiprocessing.Value`` for curricular augmentation.
     """
     if split == "train":
         transform = get_train_transform(
             image_size=getattr(args, "image_size", 224),
             augmentation=getattr(args, "augmentation", "default"),
+            total_epochs=getattr(args, "epochs", 30),
+            epoch_state=epoch_state,
         )
     else:
         transform = get_val_transform(
@@ -160,11 +164,19 @@ def build_train_val_loaders(
     if not dataset_names:
         raise ValueError("No datasets specified for training")
 
+    # Create shared epoch counter for curricular augmentation
+    augmentation = getattr(args, "augmentation", "default")
+    epoch_state = None
+    if augmentation == "genai_curriculum":
+        epoch_state = multiprocessing.Value("i", 0)
+
     # Build datasets with both train and val transforms
     train_transform_datasets: Dict[str, BaseGenAIDataset] = {}
     val_transform_datasets: Dict[str, BaseGenAIDataset] = {}
     for name in dataset_names:
-        train_transform_datasets[name] = build_dataset(name, args, split="train")
+        train_transform_datasets[name] = build_dataset(
+            name, args, split="train", epoch_state=epoch_state,
+        )
         val_transform_datasets[name] = build_dataset(name, args, split="val")
         print(f"  [full] {name}: {len(train_transform_datasets[name]):,} samples")
 
@@ -192,6 +204,7 @@ def build_train_val_loaders(
         else:
             train_kw["shuffle"] = True
         train_loader = DataLoader(train_subset, **train_kw)
+        train_loader._epoch_state = epoch_state
 
         val_kw = _make_loader_kwargs(args, is_train=False)
         if getattr(args, "distributed", False):
@@ -231,7 +244,9 @@ def build_train_val_loaders(
                 )
             else:
                 train_kw["shuffle"] = True
-            train_loaders[name] = DataLoader(train_sub, **train_kw)
+            loader = DataLoader(train_sub, **train_kw)
+            loader._epoch_state = epoch_state
+            train_loaders[name] = loader
 
             val_kw = _make_loader_kwargs(args, is_train=False)
             if getattr(args, "distributed", False):
