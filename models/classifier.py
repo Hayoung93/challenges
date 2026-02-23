@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from mambavision import create_model
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 
 VALID_MODELS = [
     "mamba_vision_T", "mamba_vision_T2", "mamba_vision_S",

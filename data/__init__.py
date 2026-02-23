@@ -69,8 +69,12 @@ def _collate_fn(batch):
 def _make_loader_kwargs(args, is_train: bool) -> dict:
     """Build shared DataLoader keyword arguments."""
     num_workers = getattr(args, "num_workers", 8)
+    batch_size = getattr(args, "batch_size", 32)
+    if getattr(args, "distributed", False):
+        import torch.distributed as dist
+        batch_size = batch_size // dist.get_world_size()
     kw = {
-        "batch_size": getattr(args, "batch_size", 32),
+        "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": getattr(args, "pin_memory", True),
         "drop_last": getattr(args, "drop_last", True) if is_train else False,

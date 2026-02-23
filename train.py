@@ -59,7 +59,7 @@ def setup_distributed(args) -> tuple:
         rank=rank,
         world_size=world_size,
     )
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
     return rank, local_rank, world_size
 
 
