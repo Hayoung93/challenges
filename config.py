@@ -71,6 +71,7 @@ DEFAULTS = {
     "output_dir": "./predictions",
     "tta": "none",
     "eval_val": False,
+    "output_scores": False,
 }
 
 
@@ -198,6 +199,10 @@ def add_test_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--eval_val", action="store_true", default=DEFAULTS["eval_val"],
                     help="Run evaluation on labeled validation data")
     g.add_argument("--no_eval_val", dest="eval_val", action="store_false")
+    g.add_argument("--output_scores", action="store_true",
+                    default=DEFAULTS["output_scores"],
+                    help="Write a score CSV with softmax probabilities (image_name,score)")
+    g.add_argument("--no_output_scores", dest="output_scores", action="store_false")
     return parser
 
 

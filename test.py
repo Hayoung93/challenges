@@ -32,7 +32,8 @@ def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", imag
         image_size: Model input spatial size (for multi-scale TTA crops).
 
     Returns:
-        List of ``(image_name, predicted_label)`` tuples.
+        List of ``(image_name, predicted_label, score)`` tuples where
+        ``score`` is the softmax probability of class 1 (AI-generated).
     """
     model.eval()
     predictions = []
@@ -43,10 +44,11 @@ def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", imag
         with autocast(device_type="cuda", enabled=use_amp):
             logits = tta_forward(model, images, tta_mode, image_size=image_size)
 
+        probs = torch.softmax(logits, dim=1)[:, 1]
         preds = logits.argmax(dim=1)
 
         for i, meta in enumerate(metadata):
-            predictions.append((meta["source_id"], preds[i].item()))
+            predictions.append((meta["source_id"], preds[i].item(), probs[i].item()))
 
     return predictions
 
@@ -58,10 +60,29 @@ def generate_csv(predictions, output_path):
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["image_name", "label"])
-        for image_name, label in predictions:
-            writer.writerow([image_name, label])
+        for row in predictions:
+            writer.writerow([row[0], row[1]])
 
     print(f"Saved {len(predictions)} predictions to {output_path}")
+
+
+def generate_score_csv(predictions, output_path):
+    """Write predictions to CSV with ``image_name,score`` format.
+
+    Args:
+        predictions: List of ``(image_name, label, score)`` tuples.
+        output_path: Destination file path.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image_name", "score"])
+        for row in predictions:
+            image_name, _label, score = row
+            writer.writerow([image_name, f"{score:.6f}"])
+
+    print(f"Saved {len(predictions)} score predictions to {output_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -175,10 +196,16 @@ def main():
                                   tta_mode=args.tta, image_size=args.image_size)
             csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
             generate_csv(preds, csv_path)
+            if args.output_scores:
+                score_path = os.path.join(args.output_dir, f"scores_{subset_name}.csv")
+                generate_score_csv(preds, score_path)
             all_predictions.extend(preds)
 
         combined_csv = os.path.join(args.output_dir, "predictions_all.csv")
         generate_csv(all_predictions, combined_csv)
+        if args.output_scores:
+            combined_score_csv = os.path.join(args.output_dir, "scores_all.csv")
+            generate_score_csv(all_predictions, combined_score_csv)
     else:
         # Mode 1 or 2: single DataLoader
         print("\nRunning inference...")
@@ -188,6 +215,9 @@ def main():
         subset_name = mode_names.get(args.ntire_test_mode, "test")
         csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
         generate_csv(preds, csv_path)
+        if args.output_scores:
+            score_path = os.path.join(args.output_dir, f"scores_{subset_name}.csv")
+            generate_score_csv(preds, score_path)
 
     # Optional: evaluate on labeled val data
     if args.eval_val:
