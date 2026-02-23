@@ -1,0 +1,203 @@
+"""GenAI image detection — test/inference script."""
+
+import argparse
+import csv
+import os
+
+import torch
+from torch.amp import autocast
+from tqdm import tqdm
+
+from config import add_data_args, add_model_args, add_test_args, merge_config
+from data import build_dataloader, build_test_dataloader
+from models import build_model
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Inference
+# ═══════════════════════════════════════════════════════════════════
+
+
+@torch.no_grad()
+def run_inference(model, dataloader, device, use_amp=True, use_tta=False):
+    """Run inference on a single DataLoader.
+
+    Returns:
+        List of ``(image_name, predicted_label)`` tuples.
+    """
+    model.eval()
+    predictions = []
+
+    for images, _labels, metadata in tqdm(dataloader, desc="Inference", leave=False):
+        images = images.to(device, non_blocking=True)
+
+        with autocast(device_type="cuda", enabled=use_amp):
+            logits = model(images)
+
+            if use_tta:
+                images_flip = torch.flip(images, dims=[-1])
+                logits_flip = model(images_flip)
+                logits = (logits + logits_flip) / 2.0
+
+        preds = logits.argmax(dim=1)
+
+        for i, meta in enumerate(metadata):
+            predictions.append((meta["source_id"], preds[i].item()))
+
+    return predictions
+
+
+def generate_csv(predictions, output_path):
+    """Write predictions to CSV with ``image_name,label`` format."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image_name", "label"])
+        for image_name, label in predictions:
+            writer.writerow([image_name, label])
+
+    print(f"Saved {len(predictions)} predictions to {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Validation evaluation (labeled data)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@torch.no_grad()
+def evaluate_val(model, dataloader, device, use_amp=True):
+    """Evaluate on labeled data. Returns dict with metrics."""
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    for images, labels, _metadata in tqdm(dataloader, desc="Evaluating", leave=False):
+        images = images.to(device, non_blocking=True)
+
+        with autocast(device_type="cuda", enabled=use_amp):
+            logits = model(images)
+
+        probs = torch.softmax(logits, dim=1)[:, 1]
+        preds = logits.argmax(dim=1)
+
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.tolist())
+        all_probs.extend(probs.cpu().tolist())
+
+    num_samples = len(all_labels)
+    accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / max(num_samples, 1)
+    results = {"accuracy": accuracy, "num_samples": num_samples}
+
+    try:
+        from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
+
+        results["auc"] = roc_auc_score(all_labels, all_probs)
+        results["f1"] = f1_score(all_labels, all_preds)
+        results["confusion_matrix"] = confusion_matrix(all_labels, all_preds)
+    except ImportError:
+        print("WARNING: scikit-learn not installed, skipping AUC/F1/CM. "
+              "Install with: pip install scikit-learn")
+    except ValueError:
+        pass
+
+    return results
+
+
+def print_metrics(metrics, subset_name="val"):
+    """Pretty-print evaluation metrics."""
+    print(f"\n{'=' * 50}")
+    print(f"  Evaluation Results: {subset_name}")
+    print(f"{'=' * 50}")
+    print(f"  Samples:    {metrics['num_samples']}")
+    print(f"  Accuracy:   {metrics['accuracy']:.4f}")
+    if "auc" in metrics:
+        print(f"  AUC:        {metrics['auc']:.4f}")
+    if "f1" in metrics:
+        print(f"  F1:         {metrics['f1']:.4f}")
+    if "confusion_matrix" in metrics:
+        cm = metrics["confusion_matrix"]
+        print(f"\n  Confusion Matrix:")
+        print(f"               Pred Real  Pred Fake")
+        print(f"  Actual Real  {cm[0][0]:>8d}  {cm[0][1]:>8d}")
+        print(f"  Actual Fake  {cm[1][0]:>8d}  {cm[1][1]:>8d}")
+    print(f"{'=' * 50}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GenAI Image Detection - Inference")
+    add_data_args(parser)
+    add_model_args(parser)
+    add_test_args(parser)
+    args = parser.parse_args()
+    args = merge_config(args)
+
+    if not args.checkpoint_path:
+        raise ValueError("--checkpoint_path is required for inference")
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        args.amp = False
+
+    # Model
+    print(f"Model: {args.model_name}")
+    print(f"Checkpoint: {args.checkpoint_path}")
+    print(f"Device: {device}")
+    print(f"AMP: {args.amp}, TTA: {args.tta}")
+
+    model = build_model(args).to(device)
+    model.eval()
+
+    # Test inference
+    print(f"\nTest mode: {args.ntire_test_mode}")
+    print("Building test dataloader...")
+    test_loader = build_test_dataloader(args)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if isinstance(test_loader, dict):
+        # Mode 3: dict of DataLoaders
+        all_predictions = []
+        for subset_name, loader in test_loader.items():
+            print(f"\nRunning inference on {subset_name}...")
+            preds = run_inference(model, loader, device, args.amp, args.tta)
+            csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
+            generate_csv(preds, csv_path)
+            all_predictions.extend(preds)
+
+        combined_csv = os.path.join(args.output_dir, "predictions_all.csv")
+        generate_csv(all_predictions, combined_csv)
+    else:
+        # Mode 1 or 2: single DataLoader
+        print("\nRunning inference...")
+        preds = run_inference(model, test_loader, device, args.amp, args.tta)
+        mode_names = {1: "val_images", 2: "val_images_hard"}
+        subset_name = mode_names.get(args.ntire_test_mode, "test")
+        csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
+        generate_csv(preds, csv_path)
+
+    # Optional: evaluate on labeled val data
+    if args.eval_val:
+        print("\nBuilding validation dataloader...")
+        val_loader = build_dataloader(args, split="val")
+
+        if isinstance(val_loader, dict):
+            for subset_name, loader in val_loader.items():
+                metrics = evaluate_val(model, loader, device, args.amp)
+                print_metrics(metrics, subset_name)
+        else:
+            metrics = evaluate_val(model, val_loader, device, args.amp)
+            print_metrics(metrics, "val")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
