@@ -69,7 +69,7 @@ DEFAULTS = {
 
     # Test / inference
     "output_dir": "./predictions",
-    "tta": False,
+    "tta": "none",
     "eval_val": False,
 }
 
@@ -190,9 +190,11 @@ def add_test_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g = parser.add_argument_group("test")
     g.add_argument("--output_dir", type=str, default=DEFAULTS["output_dir"],
                     help="Directory for CSV prediction output")
-    g.add_argument("--tta", action="store_true", default=DEFAULTS["tta"],
-                    help="Enable test-time augmentation (horizontal flip)")
-    g.add_argument("--no_tta", dest="tta", action="store_false")
+    g.add_argument("--tta", type=str, nargs="?", const="flip",
+                    default=DEFAULTS["tta"],
+                    choices=["none", "flip", "multiscale", "full"],
+                    help="TTA mode: none, flip, multiscale, or full "
+                         "(default: none; --tta without value means 'flip')")
     g.add_argument("--eval_val", action="store_true", default=DEFAULTS["eval_val"],
                     help="Run evaluation on labeled validation data")
     g.add_argument("--no_eval_val", dest="eval_val", action="store_false")

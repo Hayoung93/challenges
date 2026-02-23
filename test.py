@@ -11,6 +11,7 @@ from tqdm import tqdm
 from config import add_data_args, add_model_args, add_test_args, merge_config
 from data import build_dataloader, build_test_dataloader
 from models import build_model
+from tta import tta_forward
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -19,8 +20,16 @@ from models import build_model
 
 
 @torch.no_grad()
-def run_inference(model, dataloader, device, use_amp=True, use_tta=False):
+def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", image_size=224):
     """Run inference on a single DataLoader.
+
+    Args:
+        model: Classifier model.
+        dataloader: DataLoader yielding ``(images, labels, metadata)``.
+        device: ``torch.device`` to run on.
+        use_amp: Enable automatic mixed precision.
+        tta_mode: TTA strategy — ``"none"``, ``"flip"``, ``"multiscale"``, or ``"full"``.
+        image_size: Model input spatial size (for multi-scale TTA crops).
 
     Returns:
         List of ``(image_name, predicted_label)`` tuples.
@@ -32,12 +41,7 @@ def run_inference(model, dataloader, device, use_amp=True, use_tta=False):
         images = images.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = model(images)
-
-            if use_tta:
-                images_flip = torch.flip(images, dims=[-1])
-                logits_flip = model(images_flip)
-                logits = (logits + logits_flip) / 2.0
+            logits = tta_forward(model, images, tta_mode, image_size=image_size)
 
         preds = logits.argmax(dim=1)
 
@@ -66,7 +70,7 @@ def generate_csv(predictions, output_path):
 
 
 @torch.no_grad()
-def evaluate_val(model, dataloader, device, use_amp=True):
+def evaluate_val(model, dataloader, device, use_amp=True, tta_mode="none", image_size=224):
     """Evaluate on labeled data. Returns dict with metrics."""
     model.eval()
     all_preds = []
@@ -77,7 +81,7 @@ def evaluate_val(model, dataloader, device, use_amp=True):
         images = images.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = model(images)
+            logits = tta_forward(model, images, tta_mode, image_size=image_size)
 
         probs = torch.softmax(logits, dim=1)[:, 1]
         preds = logits.argmax(dim=1)
@@ -167,7 +171,8 @@ def main():
         all_predictions = []
         for subset_name, loader in test_loader.items():
             print(f"\nRunning inference on {subset_name}...")
-            preds = run_inference(model, loader, device, args.amp, args.tta)
+            preds = run_inference(model, loader, device, args.amp,
+                                  tta_mode=args.tta, image_size=args.image_size)
             csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
             generate_csv(preds, csv_path)
             all_predictions.extend(preds)
@@ -177,7 +182,8 @@ def main():
     else:
         # Mode 1 or 2: single DataLoader
         print("\nRunning inference...")
-        preds = run_inference(model, test_loader, device, args.amp, args.tta)
+        preds = run_inference(model, test_loader, device, args.amp,
+                              tta_mode=args.tta, image_size=args.image_size)
         mode_names = {1: "val_images", 2: "val_images_hard"}
         subset_name = mode_names.get(args.ntire_test_mode, "test")
         csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
@@ -190,10 +196,12 @@ def main():
 
         if isinstance(val_loader, dict):
             for subset_name, loader in val_loader.items():
-                metrics = evaluate_val(model, loader, device, args.amp)
+                metrics = evaluate_val(model, loader, device, args.amp,
+                                       tta_mode=args.tta, image_size=args.image_size)
                 print_metrics(metrics, subset_name)
         else:
-            metrics = evaluate_val(model, val_loader, device, args.amp)
+            metrics = evaluate_val(model, val_loader, device, args.amp,
+                                   tta_mode=args.tta, image_size=args.image_size)
             print_metrics(metrics, "val")
 
     print("Done.")

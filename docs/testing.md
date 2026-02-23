@@ -93,18 +93,43 @@ test_0002.jpg,0
 
 ## TTA (Test-Time Augmentation)
 
-`--tta` 플래그로 horizontal flip TTA를 활성화할 수 있다. 원본과 좌우 반전 이미지에 대한 logit을 평균하여 최종 예측을 수행한다.
+`--tta` 옵션으로 다양한 TTA 전략을 선택할 수 있다. 각 augmented view에 대한 logit을 평균하여 최종 예측을 수행한다.
 
 ```
-logits_final = (logits_original + logits_flipped) / 2
+logits_final = mean(logits_view_1, logits_view_2, ..., logits_view_N)
 prediction = argmax(logits_final)
 ```
 
+### TTA 모드
+
+| 모드 | Views | Forward passes | 구성 |
+|------|-------|---------------|------|
+| `none` | 1 | 1x | 원본만 (TTA 없음) |
+| `flip` | 2 | 2x | 원본 + horizontal flip |
+| `multiscale` | 4 | 4x | 원본 + 3 multi-scale crops (256, 288, 320 → CenterCrop 224) |
+| `full` | 8 | 8x | 원본 + flip + 3 rotations (90°/180°/270°) + 3 multi-scale crops |
+
+### 사용법
+
 ```bash
+# flip TTA (기존 동작과 동일, --tta만 쓰면 flip 모드)
 python test.py --checkpoint_path ./checkpoints/best.pth --tta
+
+# 명시적 모드 지정
+python test.py --checkpoint_path ./checkpoints/best.pth --tta flip
+python test.py --checkpoint_path ./checkpoints/best.pth --tta multiscale
+python test.py --checkpoint_path ./checkpoints/best.pth --tta full
+
+# TTA 없이 추론
+python test.py --checkpoint_path ./checkpoints/best.pth --tta none
+python test.py --checkpoint_path ./checkpoints/best.pth   # 기본값 = none
 ```
 
-TTA는 forward pass를 2배로 증가시키지만, gradient 계산이 없으므로 메모리 사용량은 거의 동일하다.
+### 설계 원리
+
+- **Multi-scale crop**: normalized tensor에 `F.interpolate` (bilinear) → `center_crop(224)`. Normalization은 per-channel affine transform이므로 interpolation 후 normalize와 수학적으로 동치.
+- **Rotation (90°/180°/270°)**: `torch.rot90`으로 수행하여 interpolation 없이 pixel-level 아티팩트를 완전히 보존.
+- **메모리 효율**: view별 순차 forward로 batch를 N배로 concat하지 않음. Peak memory = 원본 batch + 1 view + logits 누적합.
 
 ## Validation 평가 (--eval_val)
 
@@ -178,7 +203,7 @@ python test.py --checkpoint_path ./checkpoints/best.pth
 |------|------|--------|------|
 | `checkpoint_path` | `str` | `""` | 모델 checkpoint 경로 **(필수)** |
 | `output_dir` | `str` | `"./predictions"` | CSV 출력 디렉토리 |
-| `tta` | `bool` | `False` | Test-Time Augmentation (horizontal flip) |
+| `tta` | `str` | `"none"` | TTA 모드: `none`, `flip`, `multiscale`, `full` (값 없이 `--tta`만 쓰면 `flip`) |
 | `eval_val` | `bool` | `False` | Labeled validation 데이터 평가 수행 |
 | `amp` | `bool` | `True` | Automatic Mixed Precision |
 | `ntire_test_mode` | `int` | `1` | 테스트 subset: `1`=val_images, `2`=val_images_hard, `3`=둘 다 |
