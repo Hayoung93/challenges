@@ -245,12 +245,20 @@ def validate(
     results = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
 
     try:
-        from sklearn.metrics import f1_score, roc_auc_score
+        from sklearn.metrics import (
+            f1_score,
+            precision_score,
+            recall_score,
+            roc_auc_score,
+        )
 
         all_probs_np = torch.cat(all_probs).numpy()
         all_labels_np = torch.cat(all_labels).numpy()
+        all_preds_np = (all_probs_np >= 0.5).astype(int)
         results["auc"] = roc_auc_score(all_labels_np, all_probs_np)
-        results["f1"] = f1_score(all_labels_np, (all_probs_np >= 0.5).astype(int))
+        results["f1"] = f1_score(all_labels_np, all_preds_np)
+        results["precision"] = precision_score(all_labels_np, all_preds_np)
+        results["recall"] = recall_score(all_labels_np, all_preds_np)
     except (ImportError, ValueError):
         pass
 
@@ -364,6 +372,8 @@ def main():
         run_name = f"{args.model_name}_lr{args.lr}_bs{args.batch_size}_{timestamp}"
         tb_log_dir = os.path.join(args.log_dir, run_name)
     args._tb_log_dir = tb_log_dir
+    # Mirror run_name into save_dir so checkpoints are per-trial
+    args.save_dir = os.path.join(args.save_dir, run_name)
     writer = SummaryWriter(log_dir=tb_log_dir)
     hparam_str = "\n".join(f"  {k}: {v}" for k, v in sorted(vars(args).items()))
     writer.add_text("hyperparameters", hparam_str, 0)
@@ -405,6 +415,10 @@ def main():
                 writer.add_scalar("val/auc", val_metrics["auc"], epoch)
             if "f1" in val_metrics:
                 writer.add_scalar("val/f1", val_metrics["f1"], epoch)
+            if "precision" in val_metrics:
+                writer.add_scalar("val/precision", val_metrics["precision"], epoch)
+            if "recall" in val_metrics:
+                writer.add_scalar("val/recall", val_metrics["recall"], epoch)
 
             improved = early_stopping.step(val_metrics["accuracy"], epoch)
             if improved:
@@ -434,6 +448,10 @@ def main():
             summary += f" val_acc={val_metrics['accuracy']:.4f}"
             if "auc" in val_metrics:
                 summary += f" val_auc={val_metrics['auc']:.4f}"
+            if "precision" in val_metrics:
+                summary += f" val_prec={val_metrics['precision']:.4f}"
+            if "recall" in val_metrics:
+                summary += f" val_rec={val_metrics['recall']:.4f}"
         summary += f" | lr={optimizer.param_groups[0]['lr']:.2e}"
         if early_stopping.enabled:
             summary += f" | patience={early_stopping.counter}/{early_stopping.patience}"

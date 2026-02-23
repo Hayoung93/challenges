@@ -40,7 +40,7 @@ DEFAULTS = {
 
     # Model
     "model_name": "mamba_vision_T",
-    "pretrained": False,
+    "pretrained": True,
     "num_classes": 2,
     "freeze_backbone": False,
     "drop_rate": 0.0,
