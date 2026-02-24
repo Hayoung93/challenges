@@ -73,6 +73,13 @@ DEFAULTS = {
     "tta": "none",
     "eval_val": False,
     "output_scores": False,
+
+    # Ensemble inference
+    "ensemble_checkpoints": [],     # list of checkpoint paths
+    "ensemble_models": [],          # list of model names (parallel to checkpoints)
+    "ensemble_weights": [],         # optional per-model weights (empty = equal)
+    "ensemble_method": "mean_prob", # "mean_prob", "mean_logit", or "majority_vote"
+    "ensemble_tta": [],             # per-model TTA modes (empty = use --tta for all)
 }
 
 
@@ -207,6 +214,31 @@ def add_test_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["output_scores"],
                     help="Write a score CSV with softmax probabilities (image_name,score)")
     g.add_argument("--no_output_scores", dest="output_scores", action="store_false")
+    return parser
+
+
+def add_ensemble_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ensemble-specific arguments to *parser*."""
+    g = parser.add_argument_group("ensemble")
+    g.add_argument("--ensemble_checkpoints", nargs="+", type=str,
+                    default=DEFAULTS["ensemble_checkpoints"],
+                    help="Checkpoint paths for each ensemble member")
+    g.add_argument("--ensemble_models", nargs="+", type=str,
+                    default=DEFAULTS["ensemble_models"],
+                    help="Model names for each ensemble member "
+                         "(must match --ensemble_checkpoints length)")
+    g.add_argument("--ensemble_weights", nargs="+", type=float,
+                    default=DEFAULTS["ensemble_weights"],
+                    help="Per-model weights for weighted averaging "
+                         "(default: equal weights)")
+    g.add_argument("--ensemble_method", type=str,
+                    default=DEFAULTS["ensemble_method"],
+                    choices=["mean_prob", "mean_logit", "majority_vote"],
+                    help="Ensemble aggregation strategy")
+    g.add_argument("--ensemble_tta", nargs="+", type=str,
+                    default=DEFAULTS["ensemble_tta"],
+                    choices=["none", "flip", "multiscale", "full"],
+                    help="Per-model TTA modes (default: use --tta for all)")
     return parser
 
 
