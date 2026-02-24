@@ -1,4 +1,6 @@
-"""GenAI image classifier built on MambaVision backbones."""
+"""GenAI image classifier built on MambaVision and DINOv3 backbones."""
+
+import os
 
 import torch
 import torch.nn as nn
@@ -6,27 +8,55 @@ from mambavision import create_model
 from timm.layers import trunc_normal_
 
 VALID_MODELS = [
+    # MambaVision
     "mamba_vision_T", "mamba_vision_T2", "mamba_vision_S",
     "mamba_vision_B", "mamba_vision_B_21k",
     "mamba_vision_L", "mamba_vision_L_21k",
     "mamba_vision_L2", "mamba_vision_L2_512_21k",
     "mamba_vision_L3_256_21k", "mamba_vision_L3_512_21k",
+    # DINOv3
+    "dinov3_vits16plus",
+    "dinov3_convnext_tiny",
 ]
+
+_DINOV3_WEIGHTS = {
+    "dinov3_vits16plus": "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
+    "dinov3_convnext_tiny": "dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth",
+}
+
+
+def _create_dinov3_backbone(model_name: str, pretrained: bool, dinov3_weights_dir: str):
+    """Create a DINOv3 backbone and optionally load pretrained weights."""
+    from dinov3.hub.backbones import dinov3_convnext_tiny, dinov3_vits16plus
+
+    factory_map = {
+        "dinov3_vits16plus": dinov3_vits16plus,
+        "dinov3_convnext_tiny": dinov3_convnext_tiny,
+    }
+    factory_fn = factory_map[model_name]
+
+    if pretrained:
+        weights_path = os.path.join(dinov3_weights_dir, _DINOV3_WEIGHTS[model_name])
+        return factory_fn(pretrained=True, weights=weights_path)
+    return factory_fn(pretrained=False)
 
 
 class GenAIClassifier(nn.Module):
     """Binary classifier for GenAI image detection.
 
-    Wraps a MambaVision backbone with a configurable classification head.
+    Wraps a MambaVision or DINOv3 backbone with a configurable classification head.
 
     Args:
-        model_name: MambaVision variant (e.g., ``"mamba_vision_T"``).
-        pretrained: Load ImageNet-pretrained backbone weights.
+        model_name: Backbone variant (e.g., ``"mamba_vision_T"``,
+            ``"dinov3_vits16plus"``, ``"dinov3_convnext_tiny"``).
+        pretrained: Load pretrained backbone weights.
         num_classes: Number of output classes (default 2: real/fake).
         freeze_backbone: If True, freeze all backbone parameters.
-        drop_rate: Dropout rate passed to the MambaVision backbone.
+        drop_rate: Dropout rate passed to the MambaVision backbone
+            (ignored for DINOv3).
         checkpoint_path: Path to a full model checkpoint to load
             (applied *after* head replacement).
+        dinov3_weights_dir: Directory containing DINOv3 pretrained weight files.
     """
 
     def __init__(
@@ -37,6 +67,7 @@ class GenAIClassifier(nn.Module):
         freeze_backbone: bool = False,
         drop_rate: float = 0.0,
         checkpoint_path: str = "",
+        dinov3_weights_dir: str = "",
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -51,16 +82,26 @@ class GenAIClassifier(nn.Module):
         self.model_name = model_name
         self.num_classes = num_classes
 
-        # Create backbone with original 1000-class head so pretrained
-        # weights load without size mismatch.
-        self.backbone = create_model(
-            model_name,
-            pretrained=pretrained,
-            drop_rate=drop_rate,
-        )
+        if model_name in _DINOV3_WEIGHTS:
+            # --- DINOv3 backbone ---
+            self.backbone = _create_dinov3_backbone(
+                model_name, pretrained=pretrained,
+                dinov3_weights_dir=dinov3_weights_dir,
+            )
+            # DINOv3 models have head=nn.Identity() and embed_dim attribute.
+            num_features = self.backbone.embed_dim
+        else:
+            # --- MambaVision backbone ---
+            # Create with original 1000-class head so pretrained
+            # weights load without size mismatch.
+            self.backbone = create_model(
+                model_name,
+                pretrained=pretrained,
+                drop_rate=drop_rate,
+            )
+            num_features = self.backbone.head.in_features
 
         # Replace the classification head for our target num_classes.
-        num_features = self.backbone.head.in_features
         self.backbone.head = nn.Linear(num_features, num_classes)
         trunc_normal_(self.backbone.head.weight, std=0.02)
         nn.init.zeros_(self.backbone.head.bias)
@@ -158,4 +199,5 @@ def build_model(args) -> GenAIClassifier:
         freeze_backbone=getattr(args, "freeze_backbone", False),
         drop_rate=getattr(args, "drop_rate", 0.0),
         checkpoint_path=getattr(args, "checkpoint_path", ""),
+        dinov3_weights_dir=getattr(args, "dinov3_weights_dir", ""),
     )

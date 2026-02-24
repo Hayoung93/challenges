@@ -48,6 +48,7 @@ DEFAULTS = {
     "freeze_backbone": False,
     "drop_rate": 0.0,
     "checkpoint_path": "",
+    "dinov3_weights_dir": "/data/checkpoints/dinov3",
 
     # Training hyperparameters
     "lr": 1e-4,
@@ -132,7 +133,7 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g = parser.add_argument_group("model")
     g.add_argument("--model_name", type=str, default=DEFAULTS["model_name"],
                     choices=VALID_MODELS,
-                    help="MambaVision variant name")
+                    help="Backbone model name (MambaVision or DINOv3 variant)")
     g.add_argument("--pretrained", action="store_true", default=DEFAULTS["pretrained"],
                     help="Load ImageNet-pretrained weights")
     g.add_argument("--no_pretrained", dest="pretrained", action="store_false")
@@ -144,9 +145,12 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--no_freeze_backbone", dest="freeze_backbone",
                     action="store_false")
     g.add_argument("--drop_rate", type=float, default=DEFAULTS["drop_rate"],
-                    help="Dropout rate for MambaVision layers")
+                    help="Dropout rate (MambaVision only, ignored for DINOv3)")
     g.add_argument("--checkpoint_path", type=str, default=DEFAULTS["checkpoint_path"],
                     help="Path to a saved model checkpoint")
+    g.add_argument("--dinov3_weights_dir", type=str,
+                    default=DEFAULTS["dinov3_weights_dir"],
+                    help="Directory containing DINOv3 pretrained weight files")
     return parser
 
 

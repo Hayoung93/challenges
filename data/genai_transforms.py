@@ -10,6 +10,8 @@ import io
 import random
 
 import numpy as np
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from PIL import Image
 
 
@@ -109,6 +111,70 @@ class RandomGaussianNoise:
         )
 
 
+class RandomSaltPepperNoise:
+    """Add salt-and-pepper (impulse) noise to a PIL image.
+
+    Randomly replaces a fraction of pixels with pure white (salt, 255)
+    or pure black (pepper, 0).
+
+    Args:
+        amount: Fraction of pixels to corrupt (0.0--1.0).
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, amount=0.05, p=0.05):
+        self.amount = amount
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        arr = np.array(img)
+        h, w = arr.shape[:2]
+        mask = np.random.random((h, w))
+        arr[mask < self.amount / 2] = 255       # salt
+        arr[mask > 1 - self.amount / 2] = 0     # pepper
+        return Image.fromarray(arr)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"amount={self.amount}, p={self.p})"
+        )
+
+
+class RandomImpulseNoise:
+    """Add channel-independent impulse noise to a PIL image.
+
+    Unlike salt-and-pepper noise which sets entire pixels to black or
+    white, impulse noise corrupts each RGB channel independently,
+    producing colourful speckles.
+
+    Args:
+        amount: Fraction of channel values to corrupt (0.0--1.0).
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, amount=0.05, p=0.03):
+        self.amount = amount
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        arr = np.array(img)
+        mask = np.random.random(arr.shape)
+        arr[mask < self.amount / 2] = 255
+        arr[mask > 1 - self.amount / 2] = 0
+        return Image.fromarray(arr)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"amount={self.amount}, p={self.p})"
+        )
+
+
 class RandomPNGReencode:
     """Re-encode image through PNG format.
 
@@ -134,6 +200,63 @@ class RandomPNGReencode:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(p={self.p})"
+
+
+class RandomResizeOrCrop:
+    """Randomly choose between resize-crop and direct crop (pixel-preserving).
+
+    Path A (resize, probability ``1 - crop_p``):
+        Delegates to ``torchvision.transforms.RandomResizedCrop``.  Crops a
+        random region then resizes to ``(size, size)`` via interpolation.
+
+    Path B (crop + pad, probability ``crop_p``):
+        Takes a random ``(size, size)`` crop directly, preserving original
+        pixel-level artifacts.  If the image is smaller than *size* in either
+        dimension it is first padded with *padding_mode*.
+
+    Args:
+        size: Target square output size.
+        crop_p: Probability of choosing the crop+pad path.
+        scale: ``(min, max)`` area fraction for the resize path.
+        padding_mode: Padding mode when the image is smaller than *size*.
+    """
+
+    def __init__(self, size, crop_p=0.5, scale=(0.5, 1.0),
+                 padding_mode="reflect"):
+        self.size = size
+        self.crop_p = crop_p
+        self.scale = scale
+        self.padding_mode = padding_mode
+        self._rrc = T.RandomResizedCrop(size, scale=scale)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() < self.crop_p:
+            return self._crop_pad(img)
+        return self._rrc(img)
+
+    def _crop_pad(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        if w < self.size or h < self.size:
+            pad_w = max(self.size - w, 0)
+            pad_h = max(self.size - h, 0)
+            pad_left = pad_w // 2
+            pad_top = pad_h // 2
+            img = TF.pad(
+                img,
+                [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top],
+                padding_mode=self.padding_mode,
+            )
+            w, h = img.size
+        top = random.randint(0, h - self.size)
+        left = random.randint(0, w - self.size)
+        return TF.crop(img, top, left, self.size, self.size)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"size={self.size}, crop_p={self.crop_p}, "
+            f"scale={self.scale}, padding_mode={self.padding_mode!r})"
+        )
 
 
 class CurricularWrapper:

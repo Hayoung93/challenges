@@ -64,6 +64,48 @@ python train.py --log_dir ./runs/exp01
 python train.py --resume ./checkpoints/exp01/last.pth
 ```
 
+## DINOv3 모델 사용
+
+MambaVision 외에 DINOv3 pretrained backbone(ViT, ConvNeXt)을 사용할 수 있다.
+
+### 사용 가능한 DINOv3 모델
+
+| 모델명 | Backbone | Feature Dim | Pretrained Data |
+|--------|----------|-------------|-----------------|
+| `dinov3_vits16plus` | ViT-S+/16 | 384 | LVD-1689M |
+| `dinov3_convnext_tiny` | ConvNeXt Tiny | 768 | LVD-1689M |
+
+### CLI 사용법
+
+```bash
+# DINOv3 ViT-S+/16 학습
+python train.py --model_name dinov3_vits16plus --pretrained
+
+# DINOv3 ConvNeXt Tiny 학습
+python train.py --model_name dinov3_convnext_tiny --pretrained
+
+# Backbone freeze (head만 학습)
+python train.py --model_name dinov3_vits16plus --pretrained --freeze_backbone
+
+# 커스텀 가중치 경로
+python train.py --model_name dinov3_vits16plus --pretrained \
+    --dinov3_weights_dir /path/to/custom/weights
+```
+
+### Pretrained 가중치
+
+DINOv3 pretrained 가중치는 기본값 `/data/checkpoints/dinov3/`에 위치한다:
+- `dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth` (ViT-S+/16)
+- `dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth` (ConvNeXt Tiny)
+
+`--dinov3_weights_dir` 옵션으로 다른 디렉토리를 지정할 수 있다.
+
+### MambaVision과의 차이점
+
+- `--drop_rate`는 MambaVision 전용이며, DINOv3에서는 무시된다.
+- DINOv3는 CPU에서도 forward pass가 가능하다 (MambaVision은 CUDA 필수).
+- DINOv3는 ImageNet이 아닌 LVD-1689M 데이터로 pretrained되었다.
+
 ## 데이터 분할
 
 `build_train_val_loaders()`는 `--train_datasets`에 지정된 학습 데이터를 `--val_split_ratio` 비율로 train/val로 분할한다. `--seed`를 고정하면 동일한 분할이 재현된다.
