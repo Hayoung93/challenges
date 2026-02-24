@@ -3,14 +3,20 @@ from typing import Callable
 import torchvision.transforms as T
 
 from .genai_transforms import (
+    CurricularNOfCompose,
     CurricularWrapper,
+    RandomBoxBlur,
     RandomDownscaleUpscale,
     RandomGaussianNoise,
     RandomImpulseNoise,
     RandomJPEGCompression,
+    RandomMedianBlur,
+    RandomNOfCompose,
+    RandomPixelization,
     RandomPNGReencode,
     RandomResizeOrCrop,
     RandomSaltPepperNoise,
+    RandomSharpen,
 )
 
 # ImageNet normalization (matches MambaVision backbone)
@@ -45,6 +51,30 @@ def _genai_geometric(image_size: int, crop_p: float = 0.5) -> list:
         T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
         T.RandomGrayscale(p=0.1),
         T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+    ]
+
+
+def _augly_artifact_pool() -> list:
+    """Build a pool of artifact transforms for AugLy-hybrid N-of-K composition.
+
+    Each transform targets a distinct degradation type observed in
+    test-set augmentations.  Parameters are deliberately wider than the
+    ``genai`` pipeline to cover aggressive test-time perturbations.
+    Individual ``p`` values are set to 1.0 because selection probability
+    is controlled by :class:`RandomNOfCompose`.
+    """
+    return [
+        RandomJPEGCompression(quality_range=(20, 95), p=1.0),
+        RandomDownscaleUpscale(scale_range=(0.3, 0.9), p=1.0),
+        RandomGaussianNoise(std_range=(1.0, 15.0), p=1.0),
+        RandomSaltPepperNoise(amount=0.05, p=1.0),
+        RandomImpulseNoise(amount=0.05, p=1.0),
+        RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
+        RandomBoxBlur(radius_range=(1, 3), p=1.0),
+        RandomSharpen(factor_range=(1.0, 3.0), p=1.0),
+        RandomPixelization(ratio_range=(0.2, 0.8), p=1.0),
+        RandomPNGReencode(p=1.0),
+        T.GaussianBlur(kernel_size=5, sigma=(0.1, 3.0)),
     ]
 
 
@@ -131,6 +161,29 @@ def get_train_transform(
         return T.Compose(
             _genai_geometric(image_size)
             + [curricular, sp_curricular]
+            + _to_tensor_normalize()
+        )
+    elif augmentation == "augly":
+        return T.Compose(
+            _genai_geometric(image_size)
+            + [RandomNOfCompose(_augly_artifact_pool(), n=5)]
+            + _to_tensor_normalize()
+        )
+    elif augmentation == "augly_curriculum":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        return T.Compose(
+            _genai_geometric(image_size)
+            + [
+                CurricularNOfCompose(
+                    _augly_artifact_pool(),
+                    epoch_state=epoch_state,
+                    total_epochs=total_epochs,
+                    n_max=5,
+                    n_min=1,
+                ),
+            ]
             + _to_tensor_normalize()
         )
     else:

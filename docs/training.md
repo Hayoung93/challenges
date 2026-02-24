@@ -44,6 +44,8 @@ python train.py --augmentation default             # 기본 (RandomCrop, HFlip, 
 python train.py --augmentation strong              # 강한 geometric/color augmentation
 python train.py --augmentation genai               # GenAI artifact augmentation (JPEG압축, resize artifact, noise)
 python train.py --augmentation genai_curriculum    # GenAI augmentation + 점진적 강도 증가 (curricular)
+python train.py --augmentation augly               # AugLy 하이브리드: 11개 pool에서 5개 랜덤 선택·적용 (N-of-K)
+python train.py --augmentation augly_curriculum     # AugLy 하이브리드 + curriculum (epoch별 1→5개 점진 증가)
 
 # backbone 고정 (head만 학습)
 python train.py --freeze_backbone --lr 1e-3 --epochs 10

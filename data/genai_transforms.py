@@ -12,7 +12,7 @@ import random
 import numpy as np
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 
 class RandomJPEGCompression:
@@ -307,4 +307,249 @@ class CurricularWrapper:
             f"n_transforms={len(self.transforms)}, "
             f"total_epochs={self.total_epochs}, "
             f"min_scale={self.min_scale})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AugLy-compatible transforms & composition operators
+# ---------------------------------------------------------------------------
+
+class AugLyTransform:
+    """Wrap an AugLy ``BaseTransform`` for ``torchvision.transforms.Compose``.
+
+    AugLy transforms accept extra keyword arguments (``metadata``,
+    ``bboxes``, etc.) that torchvision's ``Compose`` does not pass.
+    This thin wrapper bridges the two APIs.
+
+    Args:
+        augly_cls: An AugLy transform **class** (not instance).
+        p: Probability of applying the transform.
+        **kwargs: Forwarded to ``augly_cls(p=1.0, **kwargs)``.
+    """
+
+    def __init__(self, augly_cls, p=1.0, **kwargs):
+        # Instantiate with p=1.0; probability is handled by this wrapper.
+        self.transform = augly_cls(p=1.0, **kwargs)
+        self.p = p
+        self._cls_name = augly_cls.__name__
+        self._kwargs = kwargs
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        return self.transform(img)
+
+    def __repr__(self):
+        kw = ", ".join(f"{k}={v!r}" for k, v in self._kwargs.items())
+        return f"AugLyTransform({self._cls_name}, p={self.p}, {kw})"
+
+
+class RandomMedianBlur:
+    """Apply a median filter with a random kernel size.
+
+    Median filtering is a non-linear smoothing technique that preserves
+    edges better than Gaussian blur.  It is commonly used in test-set
+    augmentation pipelines (e.g. AugLy, albumentations).
+
+    Args:
+        kernel_sizes: Odd-valued kernel sizes to sample from.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, kernel_sizes=(3, 5, 7), p=0.3):
+        self.kernel_sizes = kernel_sizes
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        k = random.choice(self.kernel_sizes)
+        return img.filter(ImageFilter.MedianFilter(size=k))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"kernel_sizes={self.kernel_sizes}, p={self.p})"
+        )
+
+
+class RandomBoxBlur:
+    """Apply a box (average) blur with a random radius.
+
+    Box blur replaces each pixel with the unweighted average of its
+    neighbours, producing a uniform smoothing effect distinct from
+    Gaussian blur.
+
+    Args:
+        radius_range: ``(min_radius, max_radius)`` in pixels.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, radius_range=(1, 3), p=0.3):
+        self.radius_range = radius_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        r = random.randint(*self.radius_range)
+        return img.filter(ImageFilter.BoxBlur(radius=r))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"radius_range={self.radius_range}, p={self.p})"
+        )
+
+
+class RandomSharpen:
+    """Randomly adjust image sharpness.
+
+    A factor of 1.0 leaves the image unchanged; values > 1.0 sharpen,
+    values < 1.0 blur.  Sharpening can be applied after compression or
+    blur to simulate post-processing commonly seen on social media.
+
+    Args:
+        factor_range: ``(min_factor, max_factor)``.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, factor_range=(1.0, 3.0), p=0.3):
+        self.factor_range = factor_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        factor = random.uniform(*self.factor_range)
+        return ImageEnhance.Sharpness(img).enhance(factor)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"factor_range={self.factor_range}, p={self.p})"
+        )
+
+
+class RandomPixelization:
+    """Pixelate an image by down-scaling and up-scaling with nearest-neighbour.
+
+    Unlike ``RandomDownscaleUpscale`` (which uses bilinear interpolation),
+    pixelization uses nearest-neighbour, producing blocky artifacts typical
+    of intentionally pixelated or low-resolution content.
+
+    Args:
+        ratio_range: ``(min_ratio, max_ratio)``; smaller values = more
+            pixelated.  1.0 means no change.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, ratio_range=(0.2, 0.8), p=0.2):
+        self.ratio_range = ratio_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        w, h = img.size
+        ratio = random.uniform(*self.ratio_range)
+        small_w, small_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+        small = img.resize((small_w, small_h), Image.NEAREST)
+        return small.resize((w, h), Image.NEAREST)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"ratio_range={self.ratio_range}, p={self.p})"
+        )
+
+
+class RandomNOfCompose:
+    """Randomly select *n* transforms from a pool and apply them in random order.
+
+    Designed to mimic test-set augmentation pipelines that apply a fixed
+    number of randomly chosen transforms per image (e.g. "5 of K").
+
+    When used inside ``torchvision.transforms.Compose``, each call
+    samples *n* transforms (without replacement), shuffles their order,
+    and applies them sequentially.  Individual transform ``p`` values are
+    **ignored** (all selected transforms are force-applied).
+
+    Args:
+        transforms: Pool of candidate transforms.
+        n: Number of transforms to select per call.
+    """
+
+    def __init__(self, transforms, n=5):
+        self.transforms = transforms
+        self.n = n
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        k = min(self.n, len(self.transforms))
+        selected = random.sample(self.transforms, k)
+        for t in selected:
+            original_p = getattr(t, "p", None)
+            if original_p is not None:
+                t.p = 1.0
+            img = t(img)
+            if original_p is not None:
+                t.p = original_p
+        return img
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"n={self.n}, pool_size={len(self.transforms)})"
+        )
+
+
+class CurricularNOfCompose:
+    """Curriculum-aware variant of :class:`RandomNOfCompose`.
+
+    The number of transforms applied per image increases linearly from
+    ``n_min`` at epoch 0 to ``n_max`` at the final epoch.
+
+    Args:
+        transforms: Pool of candidate transforms.
+        epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
+            training loop.
+        total_epochs: Total number of training epochs.
+        n_max: Maximum number of transforms at full curriculum.
+        n_min: Starting number of transforms at epoch 0.
+    """
+
+    def __init__(self, transforms, epoch_state, total_epochs,
+                 n_max=5, n_min=1):
+        self.transforms = transforms
+        self.epoch_state = epoch_state
+        self.total_epochs = total_epochs
+        self.n_max = n_max
+        self.n_min = n_min
+
+    def _get_n(self):
+        if self.total_epochs <= 1:
+            return self.n_max
+        progress = self.epoch_state.value / (self.total_epochs - 1)
+        progress = min(max(progress, 0.0), 1.0)
+        return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        n = self._get_n()
+        k = min(n, len(self.transforms))
+        selected = random.sample(self.transforms, k)
+        for t in selected:
+            original_p = getattr(t, "p", None)
+            if original_p is not None:
+                t.p = 1.0
+            img = t(img)
+            if original_p is not None:
+                t.p = original_p
+        return img
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"n_min={self.n_min}, n_max={self.n_max}, "
+            f"pool_size={len(self.transforms)}, "
+            f"total_epochs={self.total_epochs})"
         )
