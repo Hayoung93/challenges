@@ -510,7 +510,7 @@ def main():
 
     # Wrap model with DDP
     if args.distributed:
-        model = DDP(model, device_ids=[args._local_rank])
+        model = DDP(model, device_ids=[args._local_rank], find_unused_parameters=True)
         print_rank0("  Wrapped model with DistributedDataParallel", args)
 
     total_params = sum(p.numel() for p in model.parameters())

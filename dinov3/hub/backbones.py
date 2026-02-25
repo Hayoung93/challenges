@@ -24,6 +24,27 @@ def is_url(path: str) -> bool:
     return parsed.scheme in ("https", "file")
 
 
+def _load_state_dict(url_or_path: str, map_location="cpu", check_hash=False):
+    """Load state dict from a URL or local path, DDP-safe.
+
+    ``torch.hub.load_state_dict_from_url`` uses ``flock`` internally which
+    can deadlock when multiple DDP processes call it simultaneously (a known
+    issue inside Docker / NFS).  For local ``file://`` URLs and plain paths
+    we bypass the hub machinery and call ``torch.load`` directly.
+    """
+    parsed = urlparse(url_or_path)
+    if parsed.scheme == "file":
+        local_path = parsed.path
+        return torch.load(local_path, map_location=map_location, weights_only=True)
+    elif parsed.scheme == "":
+        # Plain filesystem path (no scheme)
+        return torch.load(url_or_path, map_location=map_location, weights_only=True)
+    else:
+        return torch.hub.load_state_dict_from_url(
+            url_or_path, map_location=map_location, check_hash=check_hash,
+        )
+
+
 def convert_path_or_url_to_url(path: str) -> str:
     if is_url(path):
         return path
@@ -137,7 +158,7 @@ def _make_dinov3_vit(
             )
         else:
             url = convert_path_or_url_to_url(weights)
-        state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu", check_hash=check_hash)
+        state_dict = _load_state_dict(url, map_location="cpu", check_hash=check_hash)
         model.load_state_dict(state_dict, strict=True)
     else:
         model.init_weights()
@@ -193,7 +214,7 @@ def _make_dinov3_convnext(
             )
         else:
             url = convert_path_or_url_to_url(weights)
-        state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu")
+        state_dict = _load_state_dict(url, map_location="cpu")
         model.load_state_dict(state_dict, strict=True)
     return model
 
