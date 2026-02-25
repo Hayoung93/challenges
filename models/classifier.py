@@ -184,7 +184,10 @@ class GenAIClassifier(nn.Module):
                 for ln in lora_names:
                     if k.startswith(ln + ".") and ".original." not in k:
                         suffix = k[len(ln) + 1:]
-                        remapped[f"{ln}.original.{suffix}"] = v
+                        if suffix.startswith("lora_"):
+                            remapped[k] = v  # keep LoRA keys as-is
+                        else:
+                            remapped[f"{ln}.original.{suffix}"] = v
                         matched = True
                         break
                 if not matched:

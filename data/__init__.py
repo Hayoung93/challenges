@@ -3,12 +3,46 @@ import os
 from typing import Dict, List, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 
 from .base import BaseGenAIDataset
 from .dragon import DragonArrowDataset
 from .ntire import NTIREDataset, NTIRETestDataset
-from .transforms import get_train_transform, get_val_transform
+from .transforms import get_train_transform, get_tta_prep_transform, get_val_transform
+
+def _get_inference_transform(args):
+    """Select the appropriate transform for inference/validation.
+
+    When any TTA mode (except ``full_legacy``) is active, images are
+    loaded at native resolution with reflect-padding for small images.
+    ``full_legacy`` and ``none`` use the standard resize+crop pipeline.
+    """
+    tta_mode = getattr(args, "tta", "none")
+    ensemble_tta = getattr(args, "ensemble_tta", [])
+    tta_min_prep_size = getattr(args, "tta_min_prep_size", 512)
+    image_size = getattr(args, "image_size", 224)
+
+    any_tta_active = (tta_mode not in ("none", "full_legacy")) or any(
+        m not in ("none", "full_legacy") for m in ensemble_tta
+    )
+
+    if any_tta_active:
+        return get_tta_prep_transform(min_prep_size=tta_min_prep_size)
+    return get_val_transform(
+        image_size=image_size,
+        resize_size=getattr(args, "resize_size", 256),
+    )
+
+
+def _is_tta_prep_active(args) -> bool:
+    """Check whether TTA prep mode (variable-size tensors) is active."""
+    tta_mode = getattr(args, "tta", "none")
+    ensemble_tta = getattr(args, "ensemble_tta", [])
+    return (tta_mode not in ("none", "full_legacy")) or any(
+        m not in ("none", "full_legacy") for m in ensemble_tta
+    )
+
 
 def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> BaseGenAIDataset:
     """Build a single dataset by name.
@@ -27,10 +61,7 @@ def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> Ba
             epoch_state=epoch_state,
         )
     else:
-        transform = get_val_transform(
-            image_size=getattr(args, "image_size", 224),
-            resize_size=getattr(args, "resize_size", 256),
-        )
+        transform = _get_inference_transform(args)
 
     if name == "dragon":
         return DragonArrowDataset(
@@ -66,6 +97,40 @@ def _collate_fn(batch):
     return images, labels, list(metadata)
 
 
+def _tta_collate_fn(batch):
+    """Collate 3-tuples with spatial padding for variable-size TTA tensors.
+
+    When the prep transform preserves native image resolution, tensors
+    in a batch may have different spatial sizes.  This function pads all
+    tensors to the maximum spatial size in the batch using replicate
+    (edge) padding, which has no size constraints unlike reflect mode.
+    """
+    images, labels, metadata = zip(*batch)
+
+    max_h = max(img.shape[1] for img in images)
+    max_w = max(img.shape[2] for img in images)
+
+    # Fast path: all same size
+    all_same = all(
+        img.shape[1] == max_h and img.shape[2] == max_w for img in images
+    )
+    if all_same:
+        images_tensor = torch.stack(list(images), dim=0)
+    else:
+        padded = []
+        for img in images:
+            _, h, w = img.shape
+            pad_right = max_w - w
+            pad_bottom = max_h - h
+            if pad_right > 0 or pad_bottom > 0:
+                img = F.pad(img, (0, pad_right, 0, pad_bottom), mode="replicate")
+            padded.append(img)
+        images_tensor = torch.stack(padded, dim=0)
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    return images_tensor, labels_tensor, list(metadata)
+
+
 def _make_loader_kwargs(args, is_train: bool) -> dict:
     """Build shared DataLoader keyword arguments."""
     num_workers = getattr(args, "num_workers", 8)
@@ -73,12 +138,16 @@ def _make_loader_kwargs(args, is_train: bool) -> dict:
     if getattr(args, "distributed", False):
         import torch.distributed as dist
         batch_size = batch_size // dist.get_world_size()
+
+    use_tta_collate = not is_train and _is_tta_prep_active(args)
+    collate = _tta_collate_fn if use_tta_collate else _collate_fn
+
     kw = {
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": getattr(args, "pin_memory", True),
         "drop_last": getattr(args, "drop_last", True) if is_train else False,
-        "collate_fn": _collate_fn,
+        "collate_fn": collate,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
@@ -284,10 +353,7 @@ def build_test_dataloader(
     test_root = os.path.join(ntire_root, "test")
     test_mode: int = getattr(args, "ntire_test_mode", 1)
 
-    transform = get_val_transform(
-        image_size=getattr(args, "image_size", 224),
-        resize_size=getattr(args, "resize_size", 256),
-    )
+    transform = _get_inference_transform(args)
 
     _MODE_SUBSETS = {
         1: ["val_images"],

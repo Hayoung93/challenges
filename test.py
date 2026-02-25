@@ -193,6 +193,9 @@ def main():
     print(f"Checkpoint: {args.checkpoint_path}")
     print(f"Device: {device}")
     print(f"AMP: {args.amp}, TTA: {args.tta}")
+    if args.tta not in ("none",):
+        min_ps = getattr(args, "tta_min_prep_size", 512)
+        print(f"TTA mode: {args.tta} (min prep size: {min_ps})")
     print(f"Output: {args.output_dir}")
 
     model = build_model(args).to(device)

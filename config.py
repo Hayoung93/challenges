@@ -78,6 +78,7 @@ DEFAULTS = {
     # Test / inference
     "output_dir": "./predictions",
     "tta": "none",
+    "tta_min_prep_size": 512,  # Minimum prep size; images >= this kept at native resolution
     "eval_val": False,
     "output_scores": False,
 
@@ -227,9 +228,15 @@ def add_test_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Directory for CSV prediction output")
     g.add_argument("--tta", type=str, nargs="?", const="flip",
                     default=DEFAULTS["tta"],
-                    choices=["none", "flip", "multiscale", "full"],
-                    help="TTA mode: none, flip, multiscale, or full "
+                    choices=["none", "flip", "multiscale", "full", "full_legacy"],
+                    help="TTA mode: none, flip, multiscale, full (pixel-preserving), "
+                         "or full_legacy (rotation-based). "
                          "(default: none; --tta without value means 'flip')")
+    g.add_argument("--tta_min_prep_size", type=int,
+                    default=DEFAULTS["tta_min_prep_size"],
+                    help="Minimum prep tensor size. Images smaller than this are "
+                         "reflect-padded; larger images kept at native resolution. "
+                         "(default: 512)")
     g.add_argument("--eval_val", action="store_true", default=DEFAULTS["eval_val"],
                     help="Run evaluation on labeled validation data")
     g.add_argument("--no_eval_val", dest="eval_val", action="store_false")
@@ -260,13 +267,16 @@ def add_ensemble_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
                     help="Ensemble aggregation strategy")
     g.add_argument("--ensemble_tta", nargs="+", type=str,
                     default=DEFAULTS["ensemble_tta"],
-                    choices=["none", "flip", "multiscale", "full"],
+                    choices=["none", "flip", "multiscale", "full", "full_legacy"],
                     help="Per-model TTA modes (default: use --tta for all)")
     return parser
 
 
 def merge_config(args: argparse.Namespace) -> argparse.Namespace:
     """Fill in any attributes missing from *args* with values from DEFAULTS."""
+    # Backward compat: old tta_prep_size -> new tta_min_prep_size
+    if hasattr(args, "tta_prep_size") and not hasattr(args, "tta_min_prep_size"):
+        args.tta_min_prep_size = args.tta_prep_size
     for key, value in DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, copy.deepcopy(value))

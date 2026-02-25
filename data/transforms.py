@@ -24,6 +24,57 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+class ResizeIfSmaller:
+    """Resize the image only if its shortest edge is smaller than *min_size*.
+
+    When the shortest edge is already >= *min_size* the image is returned
+    untouched, preserving original pixel-level artifacts.
+    """
+
+    def __init__(self, min_size: int):
+        self.min_size = min_size
+
+    def __call__(self, img):
+        w, h = img.size
+        if min(w, h) >= self.min_size:
+            return img
+        return T.functional.resize(img, self.min_size)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(min_size={self.min_size})"
+
+
+class ReflectPadIfSmaller:
+    """Reflect-pad the image if its shortest edge is smaller than *min_size*.
+
+    When the shortest edge is already >= *min_size* the image is returned
+    untouched at its original (possibly larger) resolution.  Unlike
+    :class:`ResizeIfSmaller`, this never performs interpolation — padding
+    uses mirror reflection of edge pixels, preserving pixel-level artifacts.
+    """
+
+    def __init__(self, min_size: int):
+        self.min_size = min_size
+
+    def __call__(self, img):
+        w, h = img.size
+        if min(w, h) >= self.min_size:
+            return img
+        pad_w = max(0, self.min_size - w)
+        pad_h = max(0, self.min_size - h)
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        return T.functional.pad(
+            img, (pad_left, pad_top, pad_right, pad_bottom),
+            padding_mode="reflect",
+        )
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(min_size={self.min_size})"
+
+
 def _strong_geometric(image_size: int) -> list:
     """Shared geometric + color augmentations for strong / genai pipelines."""
     return [
@@ -198,6 +249,30 @@ def get_val_transform(
     return T.Compose([
         T.Resize(resize_size),
         T.CenterCrop(image_size),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+
+def get_tta_prep_transform(
+    min_prep_size: int = 512,
+) -> Callable:
+    """Build a TTA preparation transform that preserves pixel artifacts.
+
+    Images smaller than *min_prep_size* are reflect-padded (no
+    interpolation).  Images already >= *min_prep_size* are kept at
+    their native resolution — no CenterCrop is applied, so edge
+    content is preserved for corner-crop TTA views.
+
+    Output tensor size varies by image (``max(original, min_prep_size)``).
+    Use :func:`_tta_collate_fn` in :mod:`data` for batching.
+
+    Args:
+        min_prep_size: Minimum spatial size.  Smaller images are
+            reflect-padded to this size.
+    """
+    return T.Compose([
+        ReflectPadIfSmaller(min_prep_size),
         T.ToTensor(),
         T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
