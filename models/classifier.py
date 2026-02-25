@@ -24,6 +24,41 @@ _DINOV3_WEIGHTS = {
     "dinov3_convnext_tiny": "dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth",
 }
 
+# Native training resolution for each MambaVision variant.
+_MAMBA_NATIVE_RESOLUTION = {
+    "mamba_vision_T": 224,
+    "mamba_vision_T2": 224,
+    "mamba_vision_S": 224,
+    "mamba_vision_B": 224,
+    "mamba_vision_B_21k": 224,
+    "mamba_vision_L": 224,
+    "mamba_vision_L_21k": 224,
+    "mamba_vision_L2": 224,
+    "mamba_vision_L2_512_21k": 512,
+    "mamba_vision_L3_256_21k": 256,
+    "mamba_vision_L3_512_21k": 512,
+}
+
+
+def compute_mambavision_window_size(model_name: str, image_size: int) -> list | None:
+    """Return adjusted window_size for non-native resolutions, or None to keep defaults.
+
+    MambaVision stages 2-3 use window-based attention on feature maps of size
+    ``image_size // 16`` and ``image_size // 32`` respectively.  Setting
+    ``window_size`` equal to the feature map size gives global attention,
+    matching the original 224-resolution design.
+    """
+    native = _MAMBA_NATIVE_RESOLUTION.get(model_name)
+    if native is None:  # DINOv3 or unknown model
+        return None
+    if image_size == native:
+        return None
+    if image_size % 32 != 0:
+        raise ValueError(
+            f"image_size must be divisible by 32, got {image_size}"
+        )
+    return [8, 8, image_size // 16, image_size // 32]
+
 
 def _create_dinov3_backbone(model_name: str, pretrained: bool, dinov3_weights_dir: str):
     """Create a DINOv3 backbone and optionally load pretrained weights."""
@@ -54,6 +89,10 @@ class GenAIClassifier(nn.Module):
         freeze_backbone: If True, freeze all backbone parameters.
         drop_rate: Dropout rate passed to the MambaVision backbone
             (ignored for DINOv3).
+        image_size: Input image resolution.  When this differs from the
+            model's native training resolution, ``window_size`` is
+            automatically adjusted so that stages 2-3 use global
+            attention (window = full feature map).
         checkpoint_path: Path to a full model checkpoint to load
             (applied *after* head replacement).
         dinov3_weights_dir: Directory containing DINOv3 pretrained weight files.
@@ -71,6 +110,7 @@ class GenAIClassifier(nn.Module):
         num_classes: int = 2,
         freeze_backbone: bool = False,
         drop_rate: float = 0.0,
+        image_size: int = 224,
         checkpoint_path: str = "",
         dinov3_weights_dir: str = "",
         lora_enabled: bool = False,
@@ -104,11 +144,12 @@ class GenAIClassifier(nn.Module):
             # --- MambaVision backbone ---
             # Create with original 1000-class head so pretrained
             # weights load without size mismatch.
-            self.backbone = create_model(
-                model_name,
-                pretrained=pretrained,
-                drop_rate=drop_rate,
-            )
+            create_kwargs = dict(pretrained=pretrained, drop_rate=drop_rate)
+            ws = compute_mambavision_window_size(model_name, image_size)
+            if ws is not None:
+                create_kwargs["window_size"] = ws
+                create_kwargs["resolution"] = image_size
+            self.backbone = create_model(model_name, **create_kwargs)
             num_features = self.backbone.head.in_features
 
         # Replace the classification head for our target num_classes.
@@ -252,6 +293,7 @@ def build_model(args) -> GenAIClassifier:
         num_classes=getattr(args, "num_classes", 2),
         freeze_backbone=getattr(args, "freeze_backbone", False),
         drop_rate=getattr(args, "drop_rate", 0.0),
+        image_size=getattr(args, "image_size", 224),
         checkpoint_path=getattr(args, "checkpoint_path", ""),
         dinov3_weights_dir=getattr(args, "dinov3_weights_dir", ""),
         lora_enabled=getattr(args, "lora_enabled", False),

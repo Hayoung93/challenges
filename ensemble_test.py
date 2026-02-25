@@ -95,6 +95,7 @@ def load_ensemble_models(args, device):
             num_classes=args.num_classes,
             freeze_backbone=False,
             drop_rate=0.0,
+            image_size=args.image_size,
             checkpoint_path=ckpt,
             dinov3_weights_dir=args.dinov3_weights_dir,
         )
