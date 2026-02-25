@@ -457,6 +457,10 @@ def main():
     if "RANK" in os.environ and "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ:
         args.distributed = True
 
+    # --dp and --distributed are mutually exclusive
+    if getattr(args, "dp", False) and args.distributed:
+        raise ValueError("--dp and --distributed (torchrun) are mutually exclusive")
+
     # Setup distributed
     if args.distributed:
         rank, local_rank, world_size = setup_distributed(args)
@@ -482,6 +486,8 @@ def main():
         print_rank0(f"  GPU: {torch.cuda.get_device_name(device)}", args)
         if args.distributed:
             print_rank0(f"  World size: {args._world_size}", args)
+        elif getattr(args, "dp", False):
+            print(f"  DataParallel GPUs: {torch.cuda.device_count()}")
     else:
         print_rank0("WARNING: CUDA not available, disabling AMP", args)
         args.amp = False
@@ -508,10 +514,13 @@ def main():
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         print_rank0("  Converted BatchNorm -> SyncBatchNorm", args)
 
-    # Wrap model with DDP
+    # Wrap model with DDP or DataParallel
     if args.distributed:
         model = DDP(model, device_ids=[args._local_rank], find_unused_parameters=True)
         print_rank0("  Wrapped model with DistributedDataParallel", args)
+    elif getattr(args, "dp", False) and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+        print(f"  Wrapped model with DataParallel ({torch.cuda.device_count()} GPUs)")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -543,7 +552,7 @@ def main():
     if args.resume:
         print_rank0(f"Resuming from: {args.resume}", args)
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        if args.distributed:
+        if hasattr(model, "module"):
             model.module.load_state_dict(ckpt["model"])
         else:
             model.load_state_dict(ckpt["model"])

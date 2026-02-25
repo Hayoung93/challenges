@@ -36,6 +36,7 @@ DEFAULTS = {
 
     # Distributed
     "distributed": False,
+    "dp": False,  # nn.DataParallel (single-process multi-GPU, no torchrun needed)
     "dist_backend": "nccl",
     "scale_lr": False,
     "sync_bn": False,
@@ -126,8 +127,11 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     g.add_argument("--distributed", action="store_true", default=DEFAULTS["distributed"],
-                    help="Enable distributed data parallel training")
+                    help="Enable distributed data parallel training (requires torchrun)")
     g.add_argument("--no_distributed", dest="distributed", action="store_false")
+    g.add_argument("--dp", action="store_true", default=DEFAULTS["dp"],
+                    help="Use nn.DataParallel for multi-GPU (no torchrun needed)")
+    g.add_argument("--no_dp", dest="dp", action="store_false")
     g.add_argument("--dist_backend", type=str, default=DEFAULTS["dist_backend"],
                     choices=["nccl", "gloo"],
                     help="Backend for torch.distributed (nccl for GPU, gloo for CPU)")
