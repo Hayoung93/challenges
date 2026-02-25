@@ -3,20 +3,30 @@ from typing import Callable
 import torchvision.transforms as T
 
 from .genai_transforms import (
+    CurricularGroupedNOfCompose,
     CurricularNOfCompose,
     CurricularWrapper,
+    GroupedNOfCompose,
     RandomBoxBlur,
+    RandomBrightnessCurve,
+    RandomColorQuantization,
+    RandomContrastCurve,
     RandomDownscaleUpscale,
+    RandomGammaCorrection,
     RandomGaussianNoise,
     RandomImpulseNoise,
     RandomJPEGCompression,
+    RandomLensBlur,
     RandomMedianBlur,
+    RandomMotionBlur,
     RandomNOfCompose,
     RandomPixelization,
     RandomPNGReencode,
     RandomResizeOrCrop,
     RandomSaltPepperNoise,
     RandomSharpen,
+    RandomSpatialJitter,
+    RandomWebPCompression,
 )
 
 # ImageNet normalization (matches MambaVision backbone)
@@ -129,6 +139,55 @@ def _augly_artifact_pool() -> list:
     ]
 
 
+def _robust_artifact_groups() -> dict:
+    """Build grouped artifact transforms for robust N-of-K composition.
+
+    Each group represents a distinct degradation category.  The grouped
+    composition operator selects N groups and picks one transform per
+    group, ensuring diverse degradation coverage without same-category
+    duplicates.
+
+    All transforms use ``p=1.0`` because selection probability is
+    controlled by the composition operator.
+    """
+    return {
+        "blur": [
+            T.GaussianBlur(kernel_size=5, sigma=(0.1, 3.0)),
+            RandomLensBlur(radius_range=(1, 6), p=1.0),
+            RandomMotionBlur(kernel_size_range=(3, 15), p=1.0),
+            RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
+            RandomBoxBlur(radius_range=(1, 3), p=1.0),
+        ],
+        "compression": [
+            RandomJPEGCompression(quality_range=(20, 95), p=1.0),
+            RandomWebPCompression(quality_range=(20, 95), p=1.0),
+            RandomPNGReencode(p=1.0),
+        ],
+        "noise": [
+            RandomGaussianNoise(std_range=(1.0, 15.0), p=1.0),
+            RandomSaltPepperNoise(amount=0.05, p=1.0),
+            RandomImpulseNoise(amount=0.05, p=1.0),
+        ],
+        "resize": [
+            RandomDownscaleUpscale(scale_range=(0.3, 0.9), p=1.0),
+            RandomPixelization(ratio_range=(0.2, 0.8), p=1.0),
+        ],
+        "color": [
+            RandomColorQuantization(levels_range=(7, 20), p=1.0),
+            RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0),
+            T.RandomGrayscale(p=1.0),
+        ],
+        "spatial": [
+            RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
+        ],
+        "sharpness_brightness": [
+            RandomSharpen(factor_range=(1.0, 3.0), p=1.0),
+            RandomContrastCurve(amount_range=(-0.4, 0.3), p=1.0),
+            RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
+        ],
+    }
+
+
 def _to_tensor_normalize() -> list:
     """Shared final steps: PIL → Tensor → Normalize."""
     return [
@@ -148,10 +207,11 @@ def get_train_transform(
     Args:
         image_size: Target crop size.
         augmentation: One of ``"none"``, ``"default"``, ``"strong"``,
-            ``"genai"``, ``"genai_curriculum"``.
-        total_epochs: Total training epochs (used by ``"genai_curriculum"``).
+            ``"genai"``, ``"genai_curriculum"``, ``"augly"``,
+            ``"augly_curriculum"``, ``"robust"``, ``"robust_curriculum"``.
+        total_epochs: Total training epochs (used by curricular variants).
         epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
-            training loop (used by ``"genai_curriculum"``).
+            training loop (used by curricular variants).
     """
     if augmentation == "none":
         return T.Compose([
@@ -233,6 +293,29 @@ def get_train_transform(
                     total_epochs=total_epochs,
                     n_max=5,
                     n_min=1,
+                ),
+            ]
+            + _to_tensor_normalize()
+        )
+    elif augmentation == "robust":
+        return T.Compose(
+            _genai_geometric(image_size)
+            + [GroupedNOfCompose(_robust_artifact_groups(), n=4)]
+            + _to_tensor_normalize()
+        )
+    elif augmentation == "robust_curriculum":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        return T.Compose(
+            _genai_geometric(image_size)
+            + [
+                CurricularGroupedNOfCompose(
+                    _robust_artifact_groups(),
+                    epoch_state=epoch_state,
+                    total_epochs=total_epochs,
+                    n_max=5,
+                    n_min=2,
                 ),
             ]
             + _to_tensor_normalize()

@@ -240,7 +240,7 @@ def build_train_val_loaders(
     # Create shared epoch counter for curricular augmentation
     augmentation = getattr(args, "augmentation", "default")
     epoch_state = None
-    if augmentation in ("genai_curriculum", "augly_curriculum"):
+    if augmentation in ("genai_curriculum", "augly_curriculum", "robust_curriculum"):
         epoch_state = multiprocessing.Value("i", 0)
 
     # Build datasets with both train and val transforms
