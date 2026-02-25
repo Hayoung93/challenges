@@ -108,6 +108,49 @@ DINOv3 pretrained 가중치는 기본값 `/data/checkpoints/dinov3/`에 위치�
 - DINOv3는 CPU에서도 forward pass가 가능하다 (MambaVision은 CUDA 필수).
 - DINOv3는 ImageNet이 아닌 LVD-1689M 데이터로 pretrained되었다.
 
+## LoRA (Low-Rank Adaptation)
+
+DINOv3 모델의 frozen backbone에 경량 LoRA 어댑터를 부착하여 feature를 미세 조정한다.
+Backbone은 자동으로 freeze되며, LoRA 파라미터 + head만 학습된다.
+
+### 기본 사용법
+
+```bash
+# ViT-S+ with LoRA (rank=8)
+python train.py --model_name dinov3_vits16plus --pretrained \
+    --lora_enabled --lora_rank 8 --lr 1e-4
+
+# ConvNeXt-tiny with LoRA
+python train.py --model_name dinov3_convnext_tiny --pretrained \
+    --lora_enabled --lora_rank 8 --lr 1e-4
+```
+
+### LoRA 하이퍼파라미터
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--lora_enabled` | `False` | LoRA 활성화 (DINOv3 전용) |
+| `--lora_rank` | `8` | LoRA rank (r). 4, 8, 16 권장 |
+| `--lora_alpha` | `8.0` | LoRA 스케일링. scaling = alpha/rank |
+| `--lora_dropout` | `0.0` | LoRA 브랜치 dropout |
+| `--lora_target_modules` | (자동) | LoRA 대상 모듈 오버라이드 |
+
+### 추론
+
+```bash
+python test.py --model_name dinov3_vits16plus \
+    --lora_enabled --lora_rank 8 \
+    --checkpoint_path checkpoints/run/best.pth
+```
+
+### LoRA vs Freeze-only 비교
+
+| 전략 | Trainable params (ViT-S+) | 설명 |
+|------|---------------------------|------|
+| `--freeze_backbone` | ~770 (head만) | Linear probing |
+| `--lora_enabled --lora_rank 8` | ~222K | LoRA + head |
+| (no freeze) | ~22M | Full fine-tuning |
+
 ## 데이터 분할
 
 `build_train_val_loaders()`는 `--train_datasets`에 지정된 학습 데이터를 `--val_split_ratio` 비율로 train/val로 분할한다. `--seed`를 고정하면 동일한 분할이 재현된다.

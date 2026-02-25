@@ -50,6 +50,13 @@ DEFAULTS = {
     "checkpoint_path": "",
     "dinov3_weights_dir": "/data/checkpoints/dinov3",
 
+    # LoRA
+    "lora_enabled": False,
+    "lora_rank": 8,
+    "lora_alpha": 8.0,
+    "lora_dropout": 0.0,
+    "lora_target_modules": [],  # empty = architecture defaults
+
     # Training hyperparameters
     "lr": 1e-4,
     "weight_decay": 0.05,
@@ -159,6 +166,21 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--dinov3_weights_dir", type=str,
                     default=DEFAULTS["dinov3_weights_dir"],
                     help="Directory containing DINOv3 pretrained weight files")
+    g.add_argument("--lora_enabled", action="store_true",
+                    default=DEFAULTS["lora_enabled"],
+                    help="Enable LoRA adapters (DINOv3 only)")
+    g.add_argument("--no_lora_enabled", dest="lora_enabled",
+                    action="store_false")
+    g.add_argument("--lora_rank", type=int, default=DEFAULTS["lora_rank"],
+                    help="LoRA rank r (4, 8, 16 recommended)")
+    g.add_argument("--lora_alpha", type=float, default=DEFAULTS["lora_alpha"],
+                    help="LoRA scaling factor (scaling = alpha / rank)")
+    g.add_argument("--lora_dropout", type=float,
+                    default=DEFAULTS["lora_dropout"],
+                    help="Dropout on LoRA branch")
+    g.add_argument("--lora_target_modules", nargs="+",
+                    default=DEFAULTS["lora_target_modules"],
+                    help="Override LoRA target module suffixes")
     return parser
 
 

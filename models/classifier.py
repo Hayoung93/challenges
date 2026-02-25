@@ -57,6 +57,11 @@ class GenAIClassifier(nn.Module):
         checkpoint_path: Path to a full model checkpoint to load
             (applied *after* head replacement).
         dinov3_weights_dir: Directory containing DINOv3 pretrained weight files.
+        lora_enabled: Attach LoRA adapters to the backbone (DINOv3 only).
+        lora_rank: LoRA rank *r*.
+        lora_alpha: LoRA scaling numerator.
+        lora_dropout: Dropout on the LoRA branch.
+        lora_target_modules: Override the default target module suffixes.
     """
 
     def __init__(
@@ -68,6 +73,11 @@ class GenAIClassifier(nn.Module):
         drop_rate: float = 0.0,
         checkpoint_path: str = "",
         dinov3_weights_dir: str = "",
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 8.0,
+        lora_dropout: float = 0.0,
+        lora_target_modules: list | None = None,
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -106,6 +116,22 @@ class GenAIClassifier(nn.Module):
         trunc_normal_(self.backbone.head.weight, std=0.02)
         nn.init.zeros_(self.backbone.head.bias)
 
+        # LoRA — must be applied before freeze and checkpoint load.
+        self.lora_enabled = lora_enabled
+        if lora_enabled:
+            if model_name not in _DINOV3_WEIGHTS:
+                raise ValueError("LoRA is only supported for DINOv3 models")
+            from .lora import apply_lora_to_model
+
+            apply_lora_to_model(
+                self.backbone,
+                model_name,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+                target_modules=lora_target_modules or None,
+            )
+
         if freeze_backbone:
             self._freeze_backbone()
 
@@ -113,10 +139,13 @@ class GenAIClassifier(nn.Module):
             self._load_checkpoint(checkpoint_path)
 
     def _freeze_backbone(self):
-        """Freeze all parameters except the classification head."""
+        """Freeze all parameters except the classification head (and LoRA)."""
         for name, param in self.backbone.named_parameters():
-            if not name.startswith("head."):
-                param.requires_grad = False
+            if name.startswith("head."):
+                continue
+            if self.lora_enabled and ("lora_down" in name or "lora_up" in name):
+                continue
+            param.requires_grad = False
 
     def _load_checkpoint(self, path: str):
         """Load a full model checkpoint (backbone + head)."""
@@ -139,6 +168,28 @@ class GenAIClassifier(nn.Module):
             state_dict = {
                 k.removeprefix("backbone."): v for k, v in state_dict.items()
             }
+
+        # Remap non-LoRA checkpoint keys to LoRA model structure.
+        # E.g. "blocks.0.attn.qkv.weight" → "blocks.0.attn.qkv.original.weight"
+        if self.lora_enabled:
+            from .lora import LoRALinear
+
+            lora_names = {
+                n for n, m in self.backbone.named_modules()
+                if isinstance(m, LoRALinear)
+            }
+            remapped = {}
+            for k, v in state_dict.items():
+                matched = False
+                for ln in lora_names:
+                    if k.startswith(ln + ".") and ".original." not in k:
+                        suffix = k[len(ln) + 1:]
+                        remapped[f"{ln}.original.{suffix}"] = v
+                        matched = True
+                        break
+                if not matched:
+                    remapped[k] = v
+            state_dict = remapped
 
         # Filter out keys with shape mismatches (e.g., head with different num_classes)
         model_state = self.backbone.state_dict()
@@ -200,4 +251,9 @@ def build_model(args) -> GenAIClassifier:
         drop_rate=getattr(args, "drop_rate", 0.0),
         checkpoint_path=getattr(args, "checkpoint_path", ""),
         dinov3_weights_dir=getattr(args, "dinov3_weights_dir", ""),
+        lora_enabled=getattr(args, "lora_enabled", False),
+        lora_rank=getattr(args, "lora_rank", 8),
+        lora_alpha=getattr(args, "lora_alpha", 8.0),
+        lora_dropout=getattr(args, "lora_dropout", 0.0),
+        lora_target_modules=getattr(args, "lora_target_modules", None) or None,
     )

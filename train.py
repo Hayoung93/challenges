@@ -492,6 +492,11 @@ def main():
     steps_per_epoch = len(train_loader)
     print_rank0(f"  Steps per epoch: {steps_per_epoch}", args)
 
+    # LoRA implies frozen backbone
+    if getattr(args, "lora_enabled", False) and not args.freeze_backbone:
+        args.freeze_backbone = True
+        print_rank0("  LoRA enabled: auto-freezing backbone", args)
+
     # Model
     print_rank0("Building model...", args)
     model = build_model(args).to(device)
@@ -512,6 +517,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print_rank0(f"  Total params: {total_params:,}", args)
     print_rank0(f"  Trainable params: {trainable_params:,}", args)
+    if getattr(args, "lora_enabled", False):
+        from models.lora import count_lora_params
+
+        raw_model = model.module if hasattr(model, "module") else model
+        _, _, lora_params = count_lora_params(raw_model)
+        print_rank0(f"  LoRA params: {lora_params:,}", args)
 
     # Linear LR scaling (before optimizer build)
     if args.distributed and getattr(args, "scale_lr", False):
