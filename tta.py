@@ -105,8 +105,13 @@ def generate_augmented_views(
 
     if scales is None:
         scales = DEFAULT_SCALES
+        # Auto-adjust default scales for larger image_size so that
+        # multiscale/full TTA modes work without user intervention.
+        if tta_mode in ("multiscale", "full", "full_legacy"):
+            if any(s < image_size for s in scales):
+                scales = [image_size + (i + 1) * 32 for i in range(len(DEFAULT_SCALES))]
 
-    # Validate: all scales must be >= image_size for resize→crop to work
+    # Validate user-provided scales: all must be >= image_size for resize→crop
     if tta_mode in ("multiscale", "full", "full_legacy"):
         for scale in scales:
             if scale < image_size:

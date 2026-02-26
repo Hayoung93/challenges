@@ -329,6 +329,8 @@ def get_val_transform(
     resize_size: int = 256,
 ) -> Callable:
     """Build validation/test transform pipeline."""
+    # Ensure resize_size >= image_size to prevent zero-padded CenterCrop.
+    resize_size = max(resize_size, image_size)
     return T.Compose([
         T.Resize(resize_size),
         T.CenterCrop(image_size),

@@ -284,4 +284,13 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
     for key, value in DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, copy.deepcopy(value))
+
+    # Auto-adjust resize_size so that CenterCrop never zero-pads.
+    if args.resize_size < args.image_size:
+        args.resize_size = args.image_size
+
+    # Ensure TTA prep tensors are large enough for crop-based TTA views.
+    if args.tta_min_prep_size < args.image_size + 128:
+        args.tta_min_prep_size = args.image_size + 128
+
     return args
