@@ -46,6 +46,8 @@ python train.py --augmentation genai               # GenAI artifact augmentation
 python train.py --augmentation genai_curriculum    # GenAI augmentation + 점진적 강도 증가 (curricular)
 python train.py --augmentation augly               # AugLy 하이브리드: 11개 pool에서 5개 랜덤 선택·적용 (N-of-K)
 python train.py --augmentation augly_curriculum     # AugLy 하이브리드 + curriculum (epoch별 1→5개 점진 증가)
+python train.py --augmentation robust              # Robust: 6개 그룹(blur,compression,noise,resize,color,spatial)에서 4개 선택·그룹당 1개 적용
+python train.py --augmentation robust_curriculum   # Robust + curriculum (epoch별 2→5개 그룹 점진 증가)
 
 # backbone 고정 (head만 학습)
 python train.py --freeze_backbone --lr 1e-3 --epochs 10
@@ -65,6 +67,20 @@ python train.py --log_dir ./runs/exp01
 # 학습 재개
 python train.py --resume ./checkpoints/exp01/last.pth
 ```
+
+## 고해상도 학습 (384, 512 등)
+
+`--image_size`를 변경하면 MambaVision의 `window_size`가 자동 조정된다.
+
+```bash
+# 384 해상도로 학습 (window_size=[8,8,24,12] 자동 적용)
+python train.py --image_size 384 --resize_size 384 --model_name mamba_vision_T --pretrained
+
+# 512 pretrained 모델을 384에서 fine-tune
+python train.py --image_size 384 --resize_size 384 --model_name mamba_vision_L2_512_21k --pretrained
+```
+
+224 pretrained 가중치는 384에서 shape 충돌 없이 그대로 로드된다 (position embedding 없음).
 
 ## DINOv3 모델 사용
 
