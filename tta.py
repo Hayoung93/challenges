@@ -120,10 +120,10 @@ def generate_augmented_views(
                     f"All scales must be >= image_size."
                 )
 
-    # full_legacy: center-crop to image_size, then legacy rotation-based views
+    # full_legacy: rotation-based views; scale views from native resolution
     if tta_mode == "full_legacy":
         if _has_prep_margin(images, image_size):
-            images = _center_crop(images, image_size)
+            return _generate_legacy_views_from_prep(images, image_size, scales)
         return _generate_legacy_views(images, "full", image_size, scales)
 
     if _has_prep_margin(images, image_size):
@@ -159,6 +159,45 @@ def _generate_legacy_views(
             resized = _resize_tensor(images, scale)
             cropped = _center_crop(resized, image_size)
             views.append(cropped)
+
+    return views
+
+
+def _generate_legacy_views_from_prep(
+    images: torch.Tensor,
+    image_size: int,
+    scales: List[int],
+) -> List[torch.Tensor]:
+    """Rotation-based views from a native-resolution prep tensor.
+
+    Rotation and flip views are generated from a pixel-preserving center
+    crop (no interpolation).  Scale views resize directly from the
+    native-resolution tensor — a single interpolation step instead of
+    the double interpolation that occurred when the data pipeline
+    pre-shrunk images to ``image_size``.
+
+    View composition (8 views with default scales, matching legacy
+    ``"full"`` count)::
+
+        [0]   center crop          (pixel-preserving)
+        [1]   horizontal flip      (pixel-preserving)
+        [2-4] rot90 k=1,2,3        (pixel-preserving)
+        [5..] resize(scale)→crop   (single interpolation from native)
+    """
+    center = _center_crop(images, image_size)
+    views: List[torch.Tensor] = [center]
+
+    # Flip + rotations on the center crop (pixel-preserving ops)
+    views.append(torch.flip(center, dims=[-1]))
+    views.append(torch.rot90(center, k=1, dims=[-2, -1]))
+    views.append(torch.rot90(center, k=2, dims=[-2, -1]))
+    views.append(torch.rot90(center, k=3, dims=[-2, -1]))
+
+    # Scale views: resize from the NATIVE tensor (single interpolation)
+    for scale in scales:
+        resized = _resize_tensor(images, scale)
+        cropped = _center_crop(resized, image_size)
+        views.append(cropped)
 
     return views
 

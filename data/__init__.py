@@ -14,17 +14,17 @@ from .transforms import get_train_transform, get_tta_prep_transform, get_val_tra
 def _get_inference_transform(args):
     """Select the appropriate transform for inference/validation.
 
-    When any TTA mode (except ``full_legacy``) is active, images are
-    loaded at native resolution with reflect-padding for small images.
-    ``full_legacy`` and ``none`` use the standard resize+crop pipeline.
+    When any TTA mode is active, images are loaded at native resolution
+    with reflect-padding for small images.  Only ``"none"`` uses the
+    standard resize+crop pipeline.
     """
     tta_mode = getattr(args, "tta", "none")
     ensemble_tta = getattr(args, "ensemble_tta", [])
     tta_min_prep_size = getattr(args, "tta_min_prep_size", 512)
     image_size = getattr(args, "image_size", 224)
 
-    any_tta_active = (tta_mode not in ("none", "full_legacy")) or any(
-        m not in ("none", "full_legacy") for m in ensemble_tta
+    any_tta_active = (tta_mode != "none") or any(
+        m != "none" for m in ensemble_tta
     )
 
     if any_tta_active:
@@ -39,8 +39,8 @@ def _is_tta_prep_active(args) -> bool:
     """Check whether TTA prep mode (variable-size tensors) is active."""
     tta_mode = getattr(args, "tta", "none")
     ensemble_tta = getattr(args, "ensemble_tta", [])
-    return (tta_mode not in ("none", "full_legacy")) or any(
-        m not in ("none", "full_legacy") for m in ensemble_tta
+    return (tta_mode != "none") or any(
+        m != "none" for m in ensemble_tta
     )
 
 
