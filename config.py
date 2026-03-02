@@ -58,6 +58,12 @@ DEFAULTS = {
     "lora_dropout": 0.0,
     "lora_target_modules": [],  # empty = architecture defaults
 
+    # WSGM
+    "wsgm": False,
+    "wsgm_reduction_factor": 4,
+    "wsgm_dropout": 0.5,
+    "wsgm_aggregation": "average",  # "average" or "concat"
+
     # Training hyperparameters
     "lr": 1e-4,
     "weight_decay": 0.05,
@@ -186,6 +192,21 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--lora_target_modules", nargs="+",
                     default=DEFAULTS["lora_target_modules"],
                     help="Override LoRA target module suffixes")
+    g.add_argument("--wsgm", action="store_true",
+                    default=DEFAULTS["wsgm"],
+                    help="Enable WSGM adapters (DINOv3 only)")
+    g.add_argument("--no_wsgm", dest="wsgm",
+                    action="store_false")
+    g.add_argument("--wsgm_reduction_factor", type=int,
+                    default=DEFAULTS["wsgm_reduction_factor"],
+                    help="WSGM bottleneck reduction factor (embed_dim // factor)")
+    g.add_argument("--wsgm_dropout", type=float,
+                    default=DEFAULTS["wsgm_dropout"],
+                    help="Dropout probability in WSGM modules")
+    g.add_argument("--wsgm_aggregation", type=str,
+                    default=DEFAULTS["wsgm_aggregation"],
+                    choices=["average", "concat"],
+                    help="WSGM output aggregation mode")
     return parser
 
 

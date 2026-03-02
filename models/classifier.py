@@ -101,6 +101,11 @@ class GenAIClassifier(nn.Module):
         lora_alpha: LoRA scaling numerator.
         lora_dropout: Dropout on the LoRA branch.
         lora_target_modules: Override the default target module suffixes.
+        wsgm: Attach WSGM adapters to the backbone (DINOv3 only).
+            Mutually exclusive with ``lora_enabled``.
+        wsgm_reduction_factor: WSGM bottleneck = embed_dim // factor.
+        wsgm_dropout: Dropout probability in WSGM modules.
+        wsgm_aggregation: ``"average"`` or ``"concat"``.
     """
 
     def __init__(
@@ -118,6 +123,10 @@ class GenAIClassifier(nn.Module):
         lora_alpha: float = 8.0,
         lora_dropout: float = 0.0,
         lora_target_modules: list | None = None,
+        wsgm: bool = False,
+        wsgm_reduction_factor: int = 4,
+        wsgm_dropout: float = 0.5,
+        wsgm_aggregation: str = "average",
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -131,6 +140,10 @@ class GenAIClassifier(nn.Module):
 
         self.model_name = model_name
         self.num_classes = num_classes
+
+        # Mutual exclusion
+        if wsgm and lora_enabled:
+            raise ValueError("--wsgm and --lora_enabled are mutually exclusive")
 
         if model_name in _DINOV3_WEIGHTS:
             # --- DINOv3 backbone ---
@@ -152,29 +165,48 @@ class GenAIClassifier(nn.Module):
             self.backbone = create_model(model_name, **create_kwargs)
             num_features = self.backbone.head.in_features
 
-        # Replace the classification head for our target num_classes.
-        self.backbone.head = nn.Linear(num_features, num_classes)
-        trunc_normal_(self.backbone.head.weight, std=0.02)
-        nn.init.zeros_(self.backbone.head.bias)
-
-        # LoRA — must be applied before freeze and checkpoint load.
+        # WSGM wraps the backbone with its own classifier head;
+        # otherwise replace the head normally.
         self.lora_enabled = lora_enabled
-        if lora_enabled:
+        self.wsgm_enabled = wsgm
+
+        if wsgm:
             if model_name not in _DINOV3_WEIGHTS:
-                raise ValueError("LoRA is only supported for DINOv3 models")
-            from .lora import apply_lora_to_model
+                raise ValueError("WSGM is only supported for DINOv3 models")
+            from .wsgm import WSGMWrapper
 
-            apply_lora_to_model(
-                self.backbone,
-                model_name,
-                rank=lora_rank,
-                alpha=lora_alpha,
-                dropout=lora_dropout,
-                target_modules=lora_target_modules or None,
+            self.backbone = WSGMWrapper(
+                backbone=self.backbone,
+                model_name=model_name,
+                num_classes=num_classes,
+                reduction_factor=wsgm_reduction_factor,
+                dropout=wsgm_dropout,
+                aggregation=wsgm_aggregation,
+                freeze_backbone=freeze_backbone,
             )
+        else:
+            # Replace the classification head for our target num_classes.
+            self.backbone.head = nn.Linear(num_features, num_classes)
+            trunc_normal_(self.backbone.head.weight, std=0.02)
+            nn.init.zeros_(self.backbone.head.bias)
 
-        if freeze_backbone:
-            self._freeze_backbone()
+            # LoRA — must be applied before freeze and checkpoint load.
+            if lora_enabled:
+                if model_name not in _DINOV3_WEIGHTS:
+                    raise ValueError("LoRA is only supported for DINOv3 models")
+                from .lora import apply_lora_to_model
+
+                apply_lora_to_model(
+                    self.backbone,
+                    model_name,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                    target_modules=lora_target_modules or None,
+                )
+
+            if freeze_backbone:
+                self._freeze_backbone()
 
         if checkpoint_path:
             self._load_checkpoint(checkpoint_path)
@@ -209,6 +241,16 @@ class GenAIClassifier(nn.Module):
             state_dict = {
                 k.removeprefix("backbone."): v for k, v in state_dict.items()
             }
+
+        # WSGM checkpoint remapping: when loading a non-WSGM checkpoint
+        # into a WSGM model, backbone keys need a "backbone." prefix
+        # because WSGMWrapper stores the backbone as self.backbone.
+        if self.wsgm_enabled:
+            has_wsgm_keys = any("wsgm_modules" in k for k in state_dict)
+            if not has_wsgm_keys:
+                state_dict = {
+                    f"backbone.{k}": v for k, v in state_dict.items()
+                }
 
         # Remap non-LoRA checkpoint keys to LoRA model structure.
         # E.g. "blocks.0.attn.qkv.weight" → "blocks.0.attn.qkv.original.weight"
@@ -301,4 +343,8 @@ def build_model(args) -> GenAIClassifier:
         lora_alpha=getattr(args, "lora_alpha", 8.0),
         lora_dropout=getattr(args, "lora_dropout", 0.0),
         lora_target_modules=getattr(args, "lora_target_modules", None) or None,
+        wsgm=getattr(args, "wsgm", False),
+        wsgm_reduction_factor=getattr(args, "wsgm_reduction_factor", 4),
+        wsgm_dropout=getattr(args, "wsgm_dropout", 0.5),
+        wsgm_aggregation=getattr(args, "wsgm_aggregation", "average"),
     )

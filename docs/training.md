@@ -167,6 +167,49 @@ python test.py --model_name dinov3_vits16plus \
 | `--lora_enabled --lora_rank 8` | ~222K | LoRA + head |
 | (no freeze) | ~22M | Full fine-tuning |
 
+## WSGM (Weighted Side Gating Module)
+
+DINOv3 모델의 frozen backbone에 경량 WSGM 어댑터를 부착하여 forgery-specific feature를 학습한다.
+LoRA와 상호 배제이며, backbone은 자동으로 freeze된다.
+
+### 기본 사용법
+
+```bash
+# ViT-S+ with WSGM
+python train.py --model_name dinov3_vits16plus --pretrained --wsgm
+
+# ConvNeXt-tiny with WSGM (concat 모드)
+python train.py --model_name dinov3_convnext_tiny --pretrained --wsgm --wsgm_aggregation concat
+
+# 보틀넥 비율 변경
+python train.py --model_name dinov3_vits16plus --pretrained --wsgm --wsgm_reduction_factor 8
+```
+
+### WSGM 하이퍼파라미터
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--wsgm` | `False` | WSGM 활성화 (DINOv3 전용) |
+| `--wsgm_reduction_factor` | `4` | 보틀넥 축소 비율 (embed_dim // factor) |
+| `--wsgm_dropout` | `0.5` | WSGM 모듈 내 dropout |
+| `--wsgm_aggregation` | `"average"` | `"average"` 또는 `"concat"` |
+
+### 자동 스케일링
+
+모델 크기에 따라 WSGM 파라미터가 자동 조정된다:
+
+| 아키텍처 | num_wsgm_layers | bottleneck_dim | 비고 |
+|----------|-----------------|----------------|------|
+| ViT (depth=D) | D // 2 | embed_dim // factor | 균등 분배된 레이어 인덱스 |
+| ConvNeXt (4 stages) | 4 | final_dim // factor | per-stage projection 포함 |
+
+### 추론
+
+```bash
+python test.py --model_name dinov3_vits16plus --wsgm \
+    --checkpoint_path checkpoints/run/best.pth
+```
+
 ## 데이터 분할
 
 `build_train_val_loaders()`는 `--train_datasets`에 지정된 학습 데이터를 `--val_split_ratio` 비율로 train/val로 분할한다. `--seed`를 고정하면 동일한 분할이 재현된다.

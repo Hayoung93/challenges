@@ -503,6 +503,11 @@ def main():
         args.freeze_backbone = True
         print_rank0("  LoRA enabled: auto-freezing backbone", args)
 
+    # WSGM implies frozen backbone
+    if getattr(args, "wsgm", False) and not args.freeze_backbone:
+        args.freeze_backbone = True
+        print_rank0("  WSGM enabled: auto-freezing backbone", args)
+
     # Model
     print_rank0("Building model...", args)
     model = build_model(args).to(device)
@@ -532,6 +537,12 @@ def main():
         raw_model = model.module if hasattr(model, "module") else model
         _, _, lora_params = count_lora_params(raw_model)
         print_rank0(f"  LoRA params: {lora_params:,}", args)
+    if getattr(args, "wsgm", False):
+        from models.wsgm import count_wsgm_params
+
+        raw_model = model.module if hasattr(model, "module") else model
+        _, _, wsgm_params = count_wsgm_params(raw_model)
+        print_rank0(f"  WSGM adapter params: {wsgm_params:,}", args)
 
     # Linear LR scaling (before optimizer build)
     if args.distributed and getattr(args, "scale_lr", False):
