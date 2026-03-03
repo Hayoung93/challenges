@@ -923,6 +923,205 @@ class RandomGammaCorrection:
         )
 
 
+class RandomPosterize:
+    """Reduce bit-depth per channel via ``PIL.ImageOps.posterize``.
+
+    Unlike :class:`RandomColorQuantization` which bins continuous values
+    into evenly-spaced levels, this zeroes out the least-significant bits
+    of each channel, producing hard-edge banding patterns typical of
+    social-media re-encoding and format conversion.
+
+    Args:
+        bits_range: ``(min_bits, max_bits)`` to keep, 1–7.
+            Lower = more aggressive banding.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, bits_range=(2, 6), p=0.3):
+        self.bits_range = bits_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        from PIL import ImageOps
+        bits = random.randint(*self.bits_range)
+        return ImageOps.posterize(img, bits)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"bits_range={self.bits_range}, p={self.p})"
+        )
+
+
+class RandomChromaNoise:
+    """Add Gaussian noise only to chrominance (Cb, Cr) channels.
+
+    Camera sensors and lossy codecs (JPEG, WebP) introduce significantly
+    more noise in chroma than in luma.  This transform reproduces that
+    pattern by converting to YCbCr, perturbing Cb/Cr, and converting
+    back, leaving luminance untouched.
+
+    Args:
+        std_range: ``(min_std, max_std)`` of Gaussian noise in [0, 255]
+            scale applied to Cb and Cr channels.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, std_range=(3.0, 20.0), p=0.3):
+        self.std_range = std_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        ycbcr = img.convert("YCbCr")
+        arr = np.array(ycbcr, dtype=np.float32)
+        std = random.uniform(*self.std_range)
+        noise = np.random.normal(0, std, arr[:, :, 1:].shape).astype(np.float32)
+        arr[:, :, 1:] += noise
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr, "YCbCr").convert("RGB")
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"std_range={self.std_range}, p={self.p})"
+        )
+
+
+class RandomLuminanceNoise:
+    """Add Gaussian noise only to the luminance (Y) channel.
+
+    Simulates film grain and sensor read noise that primarily affects
+    brightness while preserving color fidelity.  Operates in YCbCr
+    space, perturbing only Y.
+
+    Args:
+        std_range: ``(min_std, max_std)`` of Gaussian noise in [0, 255]
+            scale applied to the Y channel.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, std_range=(2.0, 15.0), p=0.3):
+        self.std_range = std_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        ycbcr = img.convert("YCbCr")
+        arr = np.array(ycbcr, dtype=np.float32)
+        std = random.uniform(*self.std_range)
+        noise = np.random.normal(0, std, arr[:, :, 0].shape).astype(np.float32)
+        arr[:, :, 0] += noise
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr, "YCbCr").convert("RGB")
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"std_range={self.std_range}, p={self.p})"
+        )
+
+
+class RandomBlockDistortion:
+    """Apply grid-pattern block distortion observed in challenge test sets.
+
+    Divides the image into a grid of cells and randomly replaces a
+    subset of cells with one of: solid fill (average colour), stripe
+    pattern, or heavy noise.  Sharp cell boundaries produce the
+    characteristic grid-artifact signature.
+
+    This transform is designed for low-frequency application (p ~ 0.05)
+    to match the rare occurrence in real test data.  It should be placed
+    **outside** ``GroupedNOfCompose`` as an independent pipeline step.
+
+    Args:
+        cell_size_range: ``(min, max)`` cell size in pixels.
+        affected_ratio_range: ``(min, max)`` fraction of cells to distort.
+        prob_solid: Fraction of affected cells filled with average colour.
+        prob_striped: Fraction of affected cells filled with stripe pattern.
+            Remaining affected cells receive heavy Gaussian noise.
+        noise_std: Standard deviation for noise cells.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(
+        self,
+        cell_size_range=(16, 48),
+        affected_ratio_range=(0.1, 0.5),
+        prob_solid=0.4,
+        prob_striped=0.4,
+        noise_std=40.0,
+        p=0.05,
+    ):
+        self.cell_size_range = cell_size_range
+        self.affected_ratio_range = affected_ratio_range
+        self.prob_solid = prob_solid
+        self.prob_striped = prob_striped
+        self.noise_std = noise_std
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        w, h = img.size
+        cell_size = random.randint(*self.cell_size_range)
+        affected_ratio = random.uniform(*self.affected_ratio_range)
+
+        arr = np.array(img, dtype=np.float32)
+        n_rows = math.ceil(h / cell_size)
+        n_cols = math.ceil(w / cell_size)
+        n_cells = n_rows * n_cols
+        n_affected = max(1, round(n_cells * affected_ratio))
+
+        affected_indices = set(random.sample(range(n_cells), min(n_affected, n_cells)))
+
+        solid_thresh = self.prob_solid
+        stripe_thresh = self.prob_solid + self.prob_striped
+
+        for idx in affected_indices:
+            r, c = divmod(idx, n_cols)
+            y0 = r * cell_size
+            x0 = c * cell_size
+            y1 = min(y0 + cell_size, h)
+            x1 = min(x0 + cell_size, w)
+            patch = arr[y0:y1, x0:x1]
+
+            roll = random.random()
+            if roll < solid_thresh:
+                arr[y0:y1, x0:x1] = patch.mean(axis=(0, 1))
+            elif roll < stripe_thresh:
+                ph, pw = y1 - y0, x1 - x0
+                freq = random.randint(2, 6)
+                if random.random() < 0.5:
+                    pattern = (np.sin(np.linspace(0, freq * np.pi, ph)) > 0
+                               ).astype(np.float32).reshape(-1, 1, 1)
+                else:
+                    pattern = (np.sin(np.linspace(0, freq * np.pi, pw)) > 0
+                               ).astype(np.float32).reshape(1, -1, 1)
+                base = patch.mean(axis=(0, 1))
+                stripe = np.random.uniform(0, 256, 3).astype(np.float32)
+                arr[y0:y1, x0:x1] = base * pattern + stripe * (1 - pattern)
+            else:
+                noise = np.random.normal(0, self.noise_std, patch.shape
+                                         ).astype(np.float32)
+                arr[y0:y1, x0:x1] = patch + noise
+
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"cell_size_range={self.cell_size_range}, "
+            f"affected_ratio_range={self.affected_ratio_range}, "
+            f"p={self.p})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Grouped composition operators for robust augmentation
 # ---------------------------------------------------------------------------

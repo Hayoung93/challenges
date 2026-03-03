@@ -7,8 +7,10 @@ from .genai_transforms import (
     CurricularNOfCompose,
     CurricularWrapper,
     GroupedNOfCompose,
+    RandomBlockDistortion,
     RandomBoxBlur,
     RandomBrightnessCurve,
+    RandomChromaNoise,
     RandomColorQuantization,
     RandomContrastCurve,
     RandomDownscaleUpscale,
@@ -17,11 +19,13 @@ from .genai_transforms import (
     RandomImpulseNoise,
     RandomJPEGCompression,
     RandomLensBlur,
+    RandomLuminanceNoise,
     RandomMedianBlur,
     RandomMotionBlur,
     RandomNOfCompose,
     RandomPixelization,
     RandomPNGReencode,
+    RandomPosterize,
     RandomResizeOrCrop,
     RandomSaltPepperNoise,
     RandomSharpen,
@@ -167,6 +171,8 @@ def _robust_artifact_groups() -> dict:
             RandomGaussianNoise(std_range=(1.0, 15.0), p=1.0),
             RandomSaltPepperNoise(amount=0.05, p=1.0),
             RandomImpulseNoise(amount=0.05, p=1.0),
+            RandomChromaNoise(std_range=(3.0, 20.0), p=1.0),
+            RandomLuminanceNoise(std_range=(2.0, 15.0), p=1.0),
         ],
         "resize": [
             RandomDownscaleUpscale(scale_range=(0.3, 0.9), p=1.0),
@@ -175,6 +181,7 @@ def _robust_artifact_groups() -> dict:
         "color": [
             RandomColorQuantization(levels_range=(7, 20), p=1.0),
             RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0),
+            RandomPosterize(bits_range=(2, 6), p=1.0),
             T.RandomGrayscale(p=1.0),
         ],
         "spatial": [
@@ -309,6 +316,7 @@ def get_train_transform(
         return T.Compose(
             _genai_geometric(image_size)
             + [GroupedNOfCompose(_robust_artifact_groups(), n=4)]
+            + [RandomBlockDistortion(p=0.05)]
             + _to_tensor_normalize()
         )
     elif augmentation == "robust_curriculum":
@@ -327,6 +335,7 @@ def get_train_transform(
                     curriculum_ratio=curriculum_ratio,
                 ),
             ]
+            + [RandomBlockDistortion(p=0.05)]
             + _to_tensor_normalize()
         )
     else:
