@@ -929,15 +929,18 @@ class RandomGammaCorrection:
 
 
 class GroupedNOfCompose:
-    """Select N groups, pick 1 transform per group, apply in random order.
+    """Select 1–N groups, pick 1 transform per group, apply in random order.
 
     Ensures at most one transform per semantic category (e.g. no
     blur + blur), providing diverse degradation coverage.  Inspired by
     the group-based sampling in ``aug_utils_train/utils_data.py``.
 
+    The actual number of groups selected each call is sampled uniformly
+    from ``[1, n]``, adding intensity variance across images.
+
     Args:
         groups: Dict mapping group names to lists of transform instances.
-        n: Number of groups to select per call.
+        n: Maximum number of groups to select per call.
     """
 
     def __init__(self, groups: dict, n: int = 4):
@@ -946,7 +949,10 @@ class GroupedNOfCompose:
         self.n = n
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        k = min(self.n, len(self.group_names))
+        n_upper = min(self.n, len(self.group_names))
+        if n_upper <= 0:
+            return img
+        k = random.randint(1, n_upper)
         selected_groups = random.sample(self.group_names, k)
         transforms = []
         for group_name in selected_groups:
@@ -973,8 +979,9 @@ class GroupedNOfCompose:
 class CurricularGroupedNOfCompose:
     """Curriculum-aware variant of :class:`GroupedNOfCompose`.
 
-    The number of selected groups increases linearly from ``n_min``
+    The *upper bound* of selected groups increases linearly from ``n_min``
     at epoch 0 to ``n_max`` at ``total_epochs * curriculum_ratio``.
+    The actual count each call is sampled uniformly from ``[1, upper]``.
 
     Args:
         groups: Dict mapping group names to lists of transform instances.
@@ -997,7 +1004,7 @@ class CurricularGroupedNOfCompose:
         self.n_min = n_min
         self.curriculum_ratio = curriculum_ratio
 
-    def _get_n(self):
+    def _get_n_upper(self):
         if self.total_epochs <= 1:
             return self.n_max
         curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
@@ -1006,8 +1013,10 @@ class CurricularGroupedNOfCompose:
         return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        n = self._get_n()
-        k = min(n, len(self.group_names))
+        n_upper = min(self._get_n_upper(), len(self.group_names))
+        if n_upper <= 0:
+            return img
+        k = random.randint(1, n_upper)
         selected_groups = random.sample(self.group_names, k)
         transforms = []
         for group_name in selected_groups:
