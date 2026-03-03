@@ -59,6 +59,7 @@ def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> Ba
             augmentation=getattr(args, "augmentation", "default"),
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
+            curriculum_ratio=getattr(args, "curriculum_ratio", 0.5),
         )
     else:
         transform = _get_inference_transform(args)

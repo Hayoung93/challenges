@@ -266,9 +266,10 @@ class CurricularWrapper:
     """Wrap transforms and scale their probability by training progress.
 
     At epoch 0, all child-transform probabilities are scaled down by
-    ``min_scale``; at the final epoch they reach their full configured
-    probability.  This implements a linear curriculum that starts with
-    mild augmentation and gradually increases difficulty.
+    ``min_scale``; at ``total_epochs * curriculum_ratio`` they reach
+    their full configured probability.  This implements a linear
+    curriculum that starts with mild augmentation and gradually
+    increases difficulty.
 
     The ``epoch_state`` must be a ``multiprocessing.Value('i', 0)``
     (shared-memory integer) so that persistent DataLoader workers can
@@ -279,18 +280,25 @@ class CurricularWrapper:
         epoch_state: ``multiprocessing.Value`` holding the current epoch.
         total_epochs: Total number of training epochs.
         min_scale: Probability scale factor at epoch 0.
+        curriculum_ratio: Fraction of total epochs over which the
+            curriculum ramps from ``min_scale`` to 1.0.  After that
+            point the scale stays at 1.0.  Default ``0.5`` means the
+            curriculum completes at the halfway point.
     """
 
-    def __init__(self, transforms, epoch_state, total_epochs, min_scale=0.1):
+    def __init__(self, transforms, epoch_state, total_epochs, min_scale=0.1,
+                 curriculum_ratio=0.5):
         self.transforms = transforms
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
         self.min_scale = min_scale
+        self.curriculum_ratio = curriculum_ratio
 
     def _get_scale(self):
         if self.total_epochs <= 1:
             return 1.0
-        progress = self.epoch_state.value / (self.total_epochs - 1)
+        curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
         return self.min_scale + (1.0 - self.min_scale) * progress
 
@@ -309,7 +317,8 @@ class CurricularWrapper:
             f"{self.__class__.__name__}("
             f"n_transforms={len(self.transforms)}, "
             f"total_epochs={self.total_epochs}, "
-            f"min_scale={self.min_scale})"
+            f"min_scale={self.min_scale}, "
+            f"curriculum_ratio={self.curriculum_ratio})"
         )
 
 
@@ -510,7 +519,8 @@ class CurricularNOfCompose:
     """Curriculum-aware variant of :class:`RandomNOfCompose`.
 
     The number of transforms applied per image increases linearly from
-    ``n_min`` at epoch 0 to ``n_max`` at the final epoch.
+    ``n_min`` at epoch 0 to ``n_max`` at
+    ``total_epochs * curriculum_ratio``.
 
     Args:
         transforms: Pool of candidate transforms.
@@ -519,20 +529,24 @@ class CurricularNOfCompose:
         total_epochs: Total number of training epochs.
         n_max: Maximum number of transforms at full curriculum.
         n_min: Starting number of transforms at epoch 0.
+        curriculum_ratio: Fraction of total epochs over which the
+            curriculum ramps from ``n_min`` to ``n_max``.
     """
 
     def __init__(self, transforms, epoch_state, total_epochs,
-                 n_max=5, n_min=1):
+                 n_max=5, n_min=1, curriculum_ratio=0.5):
         self.transforms = transforms
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
         self.n_max = n_max
         self.n_min = n_min
+        self.curriculum_ratio = curriculum_ratio
 
     def _get_n(self):
         if self.total_epochs <= 1:
             return self.n_max
-        progress = self.epoch_state.value / (self.total_epochs - 1)
+        curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
         return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
 
@@ -554,7 +568,8 @@ class CurricularNOfCompose:
             f"{self.__class__.__name__}("
             f"n_min={self.n_min}, n_max={self.n_max}, "
             f"pool_size={len(self.transforms)}, "
-            f"total_epochs={self.total_epochs})"
+            f"total_epochs={self.total_epochs}, "
+            f"curriculum_ratio={self.curriculum_ratio})"
         )
 
 
@@ -959,7 +974,7 @@ class CurricularGroupedNOfCompose:
     """Curriculum-aware variant of :class:`GroupedNOfCompose`.
 
     The number of selected groups increases linearly from ``n_min``
-    at epoch 0 to ``n_max`` at the final epoch.
+    at epoch 0 to ``n_max`` at ``total_epochs * curriculum_ratio``.
 
     Args:
         groups: Dict mapping group names to lists of transform instances.
@@ -968,21 +983,25 @@ class CurricularGroupedNOfCompose:
         total_epochs: Total number of training epochs.
         n_max: Maximum number of groups at full curriculum.
         n_min: Starting number of groups at epoch 0.
+        curriculum_ratio: Fraction of total epochs over which the
+            curriculum ramps from ``n_min`` to ``n_max``.
     """
 
     def __init__(self, groups, epoch_state, total_epochs,
-                 n_max=5, n_min=2):
+                 n_max=5, n_min=2, curriculum_ratio=0.5):
         self.groups = groups
         self.group_names = list(groups.keys())
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
         self.n_max = n_max
         self.n_min = n_min
+        self.curriculum_ratio = curriculum_ratio
 
     def _get_n(self):
         if self.total_epochs <= 1:
             return self.n_max
-        progress = self.epoch_state.value / (self.total_epochs - 1)
+        curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
         return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
 
@@ -1010,5 +1029,6 @@ class CurricularGroupedNOfCompose:
             f"{self.__class__.__name__}("
             f"n_min={self.n_min}, n_max={self.n_max}, "
             f"groups={group_info}, "
-            f"total_epochs={self.total_epochs})"
+            f"total_epochs={self.total_epochs}, "
+            f"curriculum_ratio={self.curriculum_ratio})"
         )

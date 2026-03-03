@@ -203,6 +203,7 @@ def get_train_transform(
     augmentation: str = "default",
     total_epochs: int = 30,
     epoch_state=None,
+    curriculum_ratio: float = 0.5,
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -214,6 +215,8 @@ def get_train_transform(
         total_epochs: Total training epochs (used by curricular variants).
         epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
             training loop (used by curricular variants).
+        curriculum_ratio: Fraction of total epochs for curriculum to
+            reach max strength (0.5 = halfway, 1.0 = original).
     """
     if augmentation == "none":
         return T.Compose([
@@ -261,6 +264,7 @@ def get_train_transform(
             epoch_state=epoch_state,
             total_epochs=total_epochs,
             min_scale=0.1,
+            curriculum_ratio=curriculum_ratio,
         )
         sp_curricular = CurricularWrapper(
             transforms=[
@@ -270,6 +274,7 @@ def get_train_transform(
             epoch_state=epoch_state,
             total_epochs=total_epochs,
             min_scale=0.02,  # 0.05 * 0.02 = 0.001 = 0.1%
+            curriculum_ratio=curriculum_ratio,
         )
         return T.Compose(
             _genai_geometric(image_size)
@@ -295,6 +300,7 @@ def get_train_transform(
                     total_epochs=total_epochs,
                     n_max=5,
                     n_min=1,
+                    curriculum_ratio=curriculum_ratio,
                 ),
             ]
             + _to_tensor_normalize()
@@ -318,6 +324,7 @@ def get_train_transform(
                     total_epochs=total_epochs,
                     n_max=5,
                     n_min=2,
+                    curriculum_ratio=curriculum_ratio,
                 ),
             ]
             + _to_tensor_normalize()

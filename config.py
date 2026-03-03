@@ -29,6 +29,7 @@ DEFAULTS = {
     "image_size": 224,
     "resize_size": 256,
     "augmentation": "default",  # "none", "default", "strong", "genai", "genai_curriculum", "augly", "augly_curriculum"
+    "curriculum_ratio": 0.5,  # fraction of total epochs for curriculum to reach max (0.5 = halfway)
 
     # Dragon-specific
     "dragon_lru_capacity": 4,
@@ -129,6 +130,9 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--augmentation", type=str, default=DEFAULTS["augmentation"],
                     choices=["none", "default", "strong", "genai", "genai_curriculum",
                              "augly", "augly_curriculum", "robust", "robust_curriculum"])
+    g.add_argument("--curriculum_ratio", type=float, default=DEFAULTS["curriculum_ratio"],
+                    help="Fraction of total epochs for curriculum to reach max strength "
+                         "(0.5 = reach max at halfway, 1.0 = original behavior)")
     g.add_argument("--dragon_lru_capacity", type=int, default=DEFAULTS["dragon_lru_capacity"])
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])
