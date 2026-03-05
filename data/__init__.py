@@ -149,7 +149,7 @@ def _make_loader_kwargs(args, is_train: bool) -> dict:
         "pin_memory": getattr(args, "pin_memory", True),
         "drop_last": getattr(args, "drop_last", True) if is_train else False,
         "collate_fn": collate,
-        "persistent_workers": num_workers > 0,
+        "persistent_workers": num_workers > 0 and is_train,
     }
     if num_workers > 0:
         kw["prefetch_factor"] = getattr(args, "prefetch_factor", 2)

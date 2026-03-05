@@ -24,6 +24,7 @@ Usage example (3 models, each with its own TTA):
 
 import argparse
 import csv
+import gc
 import os
 from collections import defaultdict
 
@@ -157,6 +158,11 @@ def run_ensemble_inference(
 
         for meta in metadata:
             image_names.append(meta["source_id"])
+
+        del images, batch_logits, stacked, _labels, metadata
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if not all_logits:
         return []
@@ -292,6 +298,11 @@ def evaluate_ensemble_val(
         all_preds.extend(result["labels"])
         all_labels.extend(labels.tolist())
         all_probs.extend(result["scores"])
+
+        del images, batch_logits, stacked, weights_tensor, result, labels, _metadata
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
     num_samples = len(all_labels)
     accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / max(num_samples, 1)

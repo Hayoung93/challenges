@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import gc
 import os
 
 import torch
@@ -50,6 +51,10 @@ def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", imag
         for i, meta in enumerate(metadata):
             predictions.append((meta["source_id"], preds[i].item(), probs[i].item()))
 
+        del images, logits, probs, preds, _labels, metadata
+
+    gc.collect()
+    torch.cuda.empty_cache()
     return predictions
 
 
@@ -110,6 +115,8 @@ def evaluate_val(model, dataloader, device, use_amp=True, tta_mode="none", image
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(labels.tolist())
         all_probs.extend(probs.cpu().tolist())
+
+        del images, logits, probs, preds, labels, _metadata
 
     num_samples = len(all_labels)
     accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / max(num_samples, 1)
