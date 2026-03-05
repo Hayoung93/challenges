@@ -14,14 +14,25 @@ VALID_MODELS = [
     "mamba_vision_L", "mamba_vision_L_21k",
     "mamba_vision_L2", "mamba_vision_L2_512_21k",
     "mamba_vision_L3_256_21k", "mamba_vision_L3_512_21k",
-    # DINOv3
+    # DINOv3 ViT
     "dinov3_vits16plus",
+    "dinov3_vitb16",
+    "dinov3_vitl16",
+    # DINOv3 ConvNeXt
     "dinov3_convnext_tiny",
+    "dinov3_convnext_small",
+    "dinov3_convnext_base",
+    "dinov3_convnext_large",
 ]
 
 _DINOV3_WEIGHTS = {
     "dinov3_vits16plus": "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
+    "dinov3_vitb16": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_vitl16": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
     "dinov3_convnext_tiny": "dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth",
+    "dinov3_convnext_small": "dinov3_convnext_small_pretrain_lvd1689m-296db49d.pth",
+    "dinov3_convnext_base": "dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth",
+    "dinov3_convnext_large": "dinov3_convnext_large_pretrain_lvd1689m-61fa432d.pth",
 }
 
 # Native training resolution for each MambaVision variant.
@@ -62,11 +73,24 @@ def compute_mambavision_window_size(model_name: str, image_size: int) -> list | 
 
 def _create_dinov3_backbone(model_name: str, pretrained: bool, dinov3_weights_dir: str):
     """Create a DINOv3 backbone and optionally load pretrained weights."""
-    from dinov3.hub.backbones import dinov3_convnext_tiny, dinov3_vits16plus
+    from dinov3.hub.backbones import (
+        dinov3_convnext_base,
+        dinov3_convnext_large,
+        dinov3_convnext_small,
+        dinov3_convnext_tiny,
+        dinov3_vitb16,
+        dinov3_vitl16,
+        dinov3_vits16plus,
+    )
 
     factory_map = {
         "dinov3_vits16plus": dinov3_vits16plus,
+        "dinov3_vitb16": dinov3_vitb16,
+        "dinov3_vitl16": dinov3_vitl16,
         "dinov3_convnext_tiny": dinov3_convnext_tiny,
+        "dinov3_convnext_small": dinov3_convnext_small,
+        "dinov3_convnext_base": dinov3_convnext_base,
+        "dinov3_convnext_large": dinov3_convnext_large,
     }
     factory_fn = factory_map[model_name]
 

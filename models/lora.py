@@ -10,8 +10,15 @@ import torch
 import torch.nn as nn
 
 _DEFAULT_TARGETS = {
+    # ViT family: adapt attention projections
     "dinov3_vits16plus": ["attn.qkv", "attn.proj"],
+    "dinov3_vitb16": ["attn.qkv", "attn.proj"],
+    "dinov3_vitl16": ["attn.qkv", "attn.proj"],
+    # ConvNeXt family: adapt pointwise convolutions
     "dinov3_convnext_tiny": ["pwconv1", "pwconv2"],
+    "dinov3_convnext_small": ["pwconv1", "pwconv2"],
+    "dinov3_convnext_base": ["pwconv1", "pwconv2"],
+    "dinov3_convnext_large": ["pwconv1", "pwconv2"],
 }
 
 
