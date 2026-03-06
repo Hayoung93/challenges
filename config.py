@@ -34,6 +34,10 @@ DEFAULTS = {
     "curriculum_n_max_start": 3,  # upper bound at epoch 0
     "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
+    # Multi-scale training
+    "multiscale": False,
+    "multiscale_sizes": [224, 256, 288, 320, 384, 448, 512],
+
     # Dragon-specific
     "dragon_lru_capacity": 4,
     "dragon_index_cache": "/workspace/challenge_genai/.cache/dragon_index.json",
@@ -156,6 +160,14 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["curriculum_n_max_end"],
                     help="Upper bound of group count at curriculum completion "
                          "(used by robust_curriculum_range)")
+    g.add_argument("--multiscale", action="store_true",
+                    default=DEFAULTS["multiscale"],
+                    help="Enable multi-scale training (resolution changes per epoch)")
+    g.add_argument("--no_multiscale", dest="multiscale", action="store_false")
+    g.add_argument("--multiscale_sizes", nargs="+", type=int,
+                    default=DEFAULTS["multiscale_sizes"],
+                    help="Pool of input resolutions for multi-scale training "
+                         "(all must be divisible by 32)")
     g.add_argument("--dragon_lru_capacity", type=int, default=DEFAULTS["dragon_lru_capacity"])
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])
@@ -351,6 +363,20 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
     for key, value in DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, copy.deepcopy(value))
+
+    # Validate multiscale_sizes
+    if getattr(args, "multiscale", False):
+        # Defensive copy to avoid mutating DEFAULTS when argparse reuses
+        # the default list object (user did not pass --multiscale_sizes).
+        args.multiscale_sizes = list(args.multiscale_sizes)
+        for s in args.multiscale_sizes:
+            if s % 32 != 0:
+                raise ValueError(
+                    f"All multiscale_sizes must be divisible by 32, got {s}"
+                )
+        if args.image_size not in args.multiscale_sizes:
+            args.multiscale_sizes.append(args.image_size)
+            args.multiscale_sizes.sort()
 
     # Auto-adjust resize_size so that CenterCrop never zero-pads.
     if args.resize_size < args.image_size:

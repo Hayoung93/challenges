@@ -146,6 +146,98 @@ def _wrap_mamba_fp32(model: nn.Module) -> None:
         print(f"  Wrapped {patched} MambaVisionMixer layer(s) to fp32")
 
 
+def vram_precheck(
+    model: nn.Module,
+    image_size: int,
+    batch_size: int,
+    device: torch.device,
+    amp: bool = True,
+    args=None,
+) -> None:
+    """Run a dummy forward pass to verify VRAM is sufficient.
+
+    Uses the largest resolution from the multi-scale pool to ensure
+    training won't OOM mid-epoch.  If the check fails, prints a
+    diagnostic message with suggested batch sizes and exits.
+
+    Note: This check uses inference mode (no gradients) so actual
+    training VRAM usage will be higher due to gradient and optimizer
+    state memory.
+    """
+    if device.type != "cuda":
+        return
+
+    print_rank0(
+        f"  VRAM pre-check: batch_size={batch_size}, "
+        f"image_size={image_size}x{image_size} ...",
+        args,
+    )
+
+    from models.classifier import update_mambavision_window_size
+    update_mambavision_window_size(model, image_size)
+
+    dummy_input = torch.randn(
+        batch_size, 3, image_size, image_size, device=device,
+    )
+    dummy_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+    criterion_check = nn.CrossEntropyLoss()
+
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            with autocast(device_type="cuda", enabled=amp):
+                logits = model(dummy_input)
+                _ = criterion_check(logits, dummy_labels)
+        model.train(was_training)
+
+        del dummy_input, dummy_labels, logits
+        torch.cuda.empty_cache()
+        print_rank0("  VRAM pre-check: PASSED", args)
+
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+
+        suggested = None
+        for try_bs in [batch_size // 2, batch_size // 4, batch_size // 8]:
+            if try_bs < 1:
+                break
+            try:
+                dummy = torch.randn(
+                    try_bs, 3, image_size, image_size, device=device,
+                )
+                model.eval()
+                with torch.no_grad():
+                    with autocast(device_type="cuda", enabled=amp):
+                        out = model(dummy)
+                del dummy, out
+                torch.cuda.empty_cache()
+                suggested = try_bs
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                continue
+
+        vram_total = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        msg = (
+            f"\n  VRAM pre-check: FAILED\n"
+            f"  GPU: {torch.cuda.get_device_name(device)} ({vram_total:.1f} GB)\n"
+            f"  Requested: batch_size={batch_size}, "
+            f"image_size={image_size}x{image_size}\n"
+        )
+        if suggested:
+            msg += f"  Suggested: --batch_size {suggested}\n"
+        else:
+            msg += (
+                f"  Even batch_size=1 failed. Consider:\n"
+                f"    - Removing {image_size} from --multiscale_sizes\n"
+                f"    - Using a smaller model\n"
+                f"    - Enabling --amp\n"
+            )
+        print(msg)
+        raise SystemExit(1)
+
+
 class AverageMeter:
     """Computes and stores a running average."""
 
@@ -586,6 +678,11 @@ def main():
         _, _, wsgm_params = count_wsgm_params(raw_model)
         print_rank0(f"  WSGM adapter params: {wsgm_params:,}", args)
 
+    # VRAM pre-check (multi-scale: verify largest resolution fits in VRAM)
+    if getattr(args, "multiscale", False) and device.type == "cuda":
+        max_size = max(args.multiscale_sizes)
+        vram_precheck(model, max_size, args.batch_size, device, args.amp, args)
+
     # Linear LR scaling (before optimizer build)
     if args.distributed and getattr(args, "scale_lr", False):
         original_lr = args.lr
@@ -665,6 +762,7 @@ def main():
 
     # Curricular augmentation epoch state (None when not using genai_curriculum)
     _epoch_state = getattr(train_loader, "_epoch_state", None)
+    _scale_state = getattr(train_loader, "_scale_state", None)
 
     epoch = max(start_epoch - 1, 0)
     for epoch in range(start_epoch, args.epochs):
@@ -673,6 +771,20 @@ def main():
         # Update curriculum augmentation epoch
         if _epoch_state is not None:
             _epoch_state.value = epoch
+
+        # Multi-scale: sample resolution for this epoch
+        if _scale_state is not None:
+            scales = args.multiscale_sizes
+            current_scale = scales[epoch % len(scales)]
+            _scale_state.value = current_scale
+
+            from models.classifier import update_mambavision_window_size
+            update_mambavision_window_size(model, current_scale)
+
+            print_rank0(
+                f"  Multi-scale: epoch {epoch} -> {current_scale}x{current_scale}",
+                args,
+            )
 
         # Set epoch on DistributedSampler for proper shuffling
         if args.distributed and hasattr(train_loader, "sampler"):
@@ -690,6 +802,8 @@ def main():
             writer.add_scalar("train/loss", train_metrics["loss"], epoch)
             writer.add_scalar("train/accuracy", train_metrics["accuracy"], epoch)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+            if _scale_state is not None:
+                writer.add_scalar("train/image_size", _scale_state.value, epoch)
             # Multi-view sub-loss components
             for key in ("loss_ce", "loss_supcon", "loss_mvc"):
                 if key in train_metrics:
@@ -698,7 +812,16 @@ def main():
         # Validate
         val_metrics = None
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
+            # MambaVision: restore default resolution window_size for validation
+            if _scale_state is not None:
+                from models.classifier import update_mambavision_window_size
+                update_mambavision_window_size(model, args.image_size)
+
             val_metrics = validate(model, val_loader, val_criterion, device, epoch, args)
+
+            # MambaVision: re-apply current scale for next training epoch
+            if _scale_state is not None:
+                update_mambavision_window_size(model, _scale_state.value)
 
             if writer is not None:
                 writer.add_scalar("val/loss", val_metrics["loss"], epoch)
@@ -735,6 +858,8 @@ def main():
         elapsed = time.time() - epoch_start
         if is_main_process(args):
             summary = f"Epoch {epoch}/{args.epochs - 1} ({elapsed:.1f}s)"
+            if _scale_state is not None:
+                summary += f" [{_scale_state.value}px]"
             summary += f" | train_loss={train_metrics['loss']:.4f}"
             summary += f" train_acc={train_metrics['accuracy']:.4f}"
             if val_metrics:

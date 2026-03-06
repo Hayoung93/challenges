@@ -71,6 +71,39 @@ def compute_mambavision_window_size(model_name: str, image_size: int) -> list | 
     return [8, 8, image_size // 16, image_size // 32]
 
 
+def update_mambavision_window_size(model: nn.Module, image_size: int) -> None:
+    """Dynamically update window_size for MambaVision transformer stages.
+
+    MambaVision stages 2-3 use window-based attention.  By default,
+    window_size equals the feature map size (global attention).  This
+    function updates ``window_size`` on the relevant layers to match a
+    new input resolution, preserving the global-attention semantics.
+
+    For non-MambaVision models this function is a no-op.
+
+    Args:
+        model: The model (or DDP-wrapped model).  Unwraps ``.module``
+            and ``.backbone`` as needed to reach the MambaVision levels.
+        image_size: Current input resolution.
+    """
+    # Unwrap DDP / DataParallel
+    raw = model.module if hasattr(model, "module") else model
+    # Unwrap GenAIClassifier
+    backbone = raw.backbone if hasattr(raw, "backbone") else raw
+
+    if not hasattr(backbone, "levels"):
+        return
+
+    # stages 0,1 are conv (no window attention) — skip
+    # stages 2,3 are transformer — update window_size
+    for stage_idx in (2, 3):
+        if stage_idx < len(backbone.levels):
+            level = backbone.levels[stage_idx]
+            if hasattr(level, "window_size"):
+                divisor = 16 * (2 ** (stage_idx - 2))  # 16 for stage 2, 32 for stage 3
+                level.window_size = image_size // divisor
+
+
 def _create_dinov3_backbone(model_name: str, pretrained: bool, dinov3_weights_dir: str):
     """Create a DINOv3 backbone and optionally load pretrained weights."""
     from dinov3.hub.backbones import (

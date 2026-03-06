@@ -44,7 +44,8 @@ def _is_tta_prep_active(args) -> bool:
     )
 
 
-def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> BaseGenAIDataset:
+def build_dataset(name: str, args, split: str = "train",
+                  epoch_state=None, scale_state=None) -> BaseGenAIDataset:
     """Build a single dataset by name.
 
     Args:
@@ -52,6 +53,7 @@ def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> Ba
         args: Namespace with config attributes (see ``config.py``).
         split: ``"train"`` or ``"val"``.
         epoch_state: ``multiprocessing.Value`` for curricular augmentation.
+        scale_state: ``multiprocessing.Value`` for multi-scale training.
     """
     if split == "train":
         transform = get_train_transform(
@@ -63,6 +65,7 @@ def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> Ba
             curriculum_n_min=getattr(args, "curriculum_n_min", 2),
             curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
+            scale_state=scale_state,
         )
     else:
         transform = _get_inference_transform(args)
@@ -266,15 +269,22 @@ def build_train_val_loaders(
     # Create shared epoch counter for curricular augmentation
     augmentation = getattr(args, "augmentation", "default")
     epoch_state = None
-    if augmentation in ("genai_curriculum", "augly_curriculum", "robust_curriculum"):
+    if augmentation in ("genai_curriculum", "augly_curriculum",
+                        "robust_curriculum", "robust_curriculum_range"):
         epoch_state = multiprocessing.Value("i", 0)
+
+    # Create shared scale counter for multi-scale training
+    scale_state = None
+    if getattr(args, "multiscale", False):
+        scale_state = multiprocessing.Value("i", getattr(args, "image_size", 224))
 
     # Build datasets with both train and val transforms
     train_transform_datasets: Dict[str, BaseGenAIDataset] = {}
     val_transform_datasets: Dict[str, BaseGenAIDataset] = {}
     for name in dataset_names:
         train_transform_datasets[name] = build_dataset(
-            name, args, split="train", epoch_state=epoch_state,
+            name, args, split="train",
+            epoch_state=epoch_state, scale_state=scale_state,
         )
         val_transform_datasets[name] = build_dataset(name, args, split="val")
         print(f"  [full] {name}: {len(train_transform_datasets[name]):,} samples")
@@ -291,6 +301,7 @@ def build_train_val_loaders(
             curriculum_n_min=getattr(args, "curriculum_n_min", 2),
             curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
+            scale_state=scale_state,
         )
         for name in dataset_names:
             train_transform_datasets[name] = MultiViewDataset(
@@ -323,6 +334,7 @@ def build_train_val_loaders(
             train_kw["shuffle"] = True
         train_loader = DataLoader(train_subset, **train_kw)
         train_loader._epoch_state = epoch_state
+        train_loader._scale_state = scale_state
 
         val_kw = _make_loader_kwargs(args, is_train=False)
         if getattr(args, "distributed", False):
@@ -364,6 +376,7 @@ def build_train_val_loaders(
                 train_kw["shuffle"] = True
             loader = DataLoader(train_sub, **train_kw)
             loader._epoch_state = epoch_state
+            loader._scale_state = scale_state
             train_loaders[name] = loader
 
             val_kw = _make_loader_kwargs(args, is_train=False)

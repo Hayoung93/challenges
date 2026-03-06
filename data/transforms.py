@@ -90,6 +90,43 @@ class ReflectPadIfSmaller:
         return f"{self.__class__.__name__}(min_size={self.min_size})"
 
 
+class MultiscaleTransformWrapper:
+    """Wrap a transform factory to read target size from shared state.
+
+    Each call reads ``scale_state.value`` to determine the current
+    target resolution, then delegates to the appropriate transform.
+    Transform instances are cached per resolution to avoid repeated
+    construction.
+
+    Args:
+        build_fn: Callable ``(image_size) -> transform`` that builds a
+            complete transform pipeline for a given resolution.
+        scale_state: ``multiprocessing.Value('i', ...)`` holding the
+            current target resolution.
+        default_size: Fallback size when ``scale_state`` is not set.
+    """
+
+    def __init__(self, build_fn, scale_state, default_size: int = 224):
+        self.build_fn = build_fn
+        self.scale_state = scale_state
+        self.default_size = default_size
+        self._cache = {}
+
+    def __call__(self, img):
+        size = self.scale_state.value if self.scale_state is not None else self.default_size
+        if size not in self._cache:
+            self._cache[size] = self.build_fn(size)
+        return self._cache[size](img)
+
+    def __repr__(self):
+        cached = sorted(self._cache.keys())
+        return (
+            f"{self.__class__.__name__}("
+            f"default_size={self.default_size}, "
+            f"cached_sizes={cached})"
+        )
+
+
 def _strong_geometric(image_size: int) -> list:
     """Shared geometric + color augmentations for strong / genai pipelines."""
     return [
@@ -268,6 +305,7 @@ def get_train_transform(
     curriculum_n_min: int = 2,
     curriculum_n_max_start: int = 3,
     curriculum_n_max_end: int = 7,
+    scale_state=None,
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -286,7 +324,26 @@ def get_train_transform(
         curriculum_n_max_start: Upper bound of group count at epoch 0.
         curriculum_n_max_end: Upper bound of group count at curriculum
             completion.
+        scale_state: ``multiprocessing.Value('i', ...)`` holding the
+            current target resolution for multi-scale training.
+            When provided, returns a :class:`MultiscaleTransformWrapper`.
     """
+    # Multi-scale: wrap with dynamic resolution dispatch
+    if scale_state is not None:
+        def _build_for_size(sz):
+            return get_train_transform(
+                image_size=sz,
+                augmentation=augmentation,
+                total_epochs=total_epochs,
+                epoch_state=epoch_state,
+                curriculum_ratio=curriculum_ratio,
+                curriculum_n_min=curriculum_n_min,
+                curriculum_n_max_start=curriculum_n_max_start,
+                curriculum_n_max_end=curriculum_n_max_end,
+                scale_state=None,  # prevent recursion
+            )
+        return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
+
     if augmentation == "none":
         return T.Compose([
             T.Resize(image_size),
