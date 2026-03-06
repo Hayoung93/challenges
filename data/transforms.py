@@ -9,6 +9,7 @@ from .genai_transforms import (
     GroupedNOfCompose,
     RandomBlockDistortion,
     RandomBoxBlur,
+    RandomMoire,
     RandomBrightnessCurve,
     RandomChromaNoise,
     RandomColorQuantization,
@@ -197,6 +198,59 @@ def _robust_artifact_groups() -> dict:
     }
 
 
+def _robust_artifact_groups_extended() -> dict:
+    """Build grouped artifact transforms with extended intensity ranges.
+
+    Compared to :func:`_robust_artifact_groups`, every group's maximum
+    strength is raised to cover more extreme real-world degradations
+    (aggressive social-media re-compression, heavy sensor noise,
+    severe motion blur, etc.).  Intended for use with
+    ``robust_curriculum_range`` where curriculum scheduling prevents
+    the model from seeing only extreme augmentations early on.
+    """
+    return {
+        "blur": [
+            T.GaussianBlur(kernel_size=5, sigma=(0.1, 10.0)),
+            RandomLensBlur(radius_range=(1, 9), p=1.0),
+            RandomMotionBlur(kernel_size_range=(3, 21), p=1.0),
+            RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
+            RandomBoxBlur(radius_range=(1, 3), p=1.0),
+        ],
+        "compression": [
+            RandomJPEGCompression(quality_range=(10, 95), p=1.0),
+            RandomWebPCompression(quality_range=(10, 95), p=1.0),
+            RandomPNGReencode(p=1.0),
+        ],
+        "noise": [
+            RandomGaussianNoise(std_range=(1.0, 25.0), p=1.0),
+            RandomSaltPepperNoise(amount=0.05, p=1.0),
+            RandomImpulseNoise(amount=0.05, p=1.0),
+            RandomChromaNoise(std_range=(3.0, 30.0), p=1.0),
+            RandomLuminanceNoise(std_range=(2.0, 22.0), p=1.0),
+        ],
+        "resize": [
+            RandomDownscaleUpscale(scale_range=(0.15, 0.9), p=1.0),
+            RandomPixelization(ratio_range=(0.2, 0.8), p=1.0),
+        ],
+        "color": [
+            RandomColorQuantization(levels_range=(7, 20), p=1.0),
+            RandomGammaCorrection(gamma_range=(0.3, 3.0), p=1.0),
+            RandomPosterize(bits_range=(2, 6), p=1.0),
+            T.RandomGrayscale(p=1.0),
+        ],
+        "spatial": [
+            RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
+            T.RandomPerspective(distortion_scale=0.3, p=1.0),
+            T.RandomRotation(degrees=15),
+        ],
+        "sharpness_brightness": [
+            RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
+            RandomContrastCurve(amount_range=(-0.4, 0.3), p=1.0),
+            RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
+        ],
+    }
+
+
 def _to_tensor_normalize() -> list:
     """Shared final steps: PIL → Tensor → Normalize."""
     return [
@@ -211,6 +265,9 @@ def get_train_transform(
     total_epochs: int = 30,
     epoch_state=None,
     curriculum_ratio: float = 0.5,
+    curriculum_n_min: int = 2,
+    curriculum_n_max_start: int = 3,
+    curriculum_n_max_end: int = 7,
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -218,12 +275,17 @@ def get_train_transform(
         image_size: Target crop size.
         augmentation: One of ``"none"``, ``"default"``, ``"strong"``,
             ``"genai"``, ``"genai_curriculum"``, ``"augly"``,
-            ``"augly_curriculum"``, ``"robust"``, ``"robust_curriculum"``.
+            ``"augly_curriculum"``, ``"robust"``, ``"robust_curriculum"``,
+            ``"robust_curriculum_range"``.
         total_epochs: Total training epochs (used by curricular variants).
         epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
             training loop (used by curricular variants).
         curriculum_ratio: Fraction of total epochs for curriculum to
             reach max strength (0.5 = halfway, 1.0 = original).
+        curriculum_n_min: Fixed lower bound for group count sampling.
+        curriculum_n_max_start: Upper bound of group count at epoch 0.
+        curriculum_n_max_end: Upper bound of group count at curriculum
+            completion.
     """
     if augmentation == "none":
         return T.Compose([
@@ -317,6 +379,7 @@ def get_train_transform(
             _genai_geometric(image_size)
             + [GroupedNOfCompose(_robust_artifact_groups(), n=4)]
             + [RandomBlockDistortion(p=0.05)]
+            + [RandomMoire(p=0.05)]
             + _to_tensor_normalize()
         )
     elif augmentation == "robust_curriculum":
@@ -336,6 +399,28 @@ def get_train_transform(
                 ),
             ]
             + [RandomBlockDistortion(p=0.05)]
+            + [RandomMoire(p=0.05)]
+            + _to_tensor_normalize()
+        )
+    elif augmentation == "robust_curriculum_range":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        return T.Compose(
+            _genai_geometric(image_size)
+            + [
+                CurricularGroupedNOfCompose(
+                    _robust_artifact_groups_extended(),
+                    epoch_state=epoch_state,
+                    total_epochs=total_epochs,
+                    n_min=curriculum_n_min,
+                    n_max_start=curriculum_n_max_start,
+                    n_max_end=curriculum_n_max_end,
+                    curriculum_ratio=curriculum_ratio,
+                ),
+            ]
+            + [RandomBlockDistortion(p=0.08)]
+            + [RandomMoire(p=0.08)]
             + _to_tensor_normalize()
         )
     else:

@@ -30,6 +30,9 @@ DEFAULTS = {
     "resize_size": 256,
     "augmentation": "default",  # "none", "default", "strong", "genai", "genai_curriculum", "augly", "augly_curriculum"
     "curriculum_ratio": 0.5,  # fraction of total epochs for curriculum to reach max (0.5 = halfway)
+    "curriculum_n_min": 2,        # fixed lower bound for group count sampling
+    "curriculum_n_max_start": 3,  # upper bound at epoch 0
+    "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
     # Dragon-specific
     "dragon_lru_capacity": 4,
@@ -129,10 +132,23 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--resize_size", type=int, default=DEFAULTS["resize_size"])
     g.add_argument("--augmentation", type=str, default=DEFAULTS["augmentation"],
                     choices=["none", "default", "strong", "genai", "genai_curriculum",
-                             "augly", "augly_curriculum", "robust", "robust_curriculum"])
+                             "augly", "augly_curriculum", "robust", "robust_curriculum",
+                             "robust_curriculum_range"])
     g.add_argument("--curriculum_ratio", type=float, default=DEFAULTS["curriculum_ratio"],
                     help="Fraction of total epochs for curriculum to reach max strength "
                          "(0.5 = reach max at halfway, 1.0 = original behavior)")
+    g.add_argument("--curriculum_n_min", type=int,
+                    default=DEFAULTS["curriculum_n_min"],
+                    help="Fixed lower bound for group count sampling "
+                         "(used by robust_curriculum_range)")
+    g.add_argument("--curriculum_n_max_start", type=int,
+                    default=DEFAULTS["curriculum_n_max_start"],
+                    help="Upper bound of group count at epoch 0 "
+                         "(used by robust_curriculum_range)")
+    g.add_argument("--curriculum_n_max_end", type=int,
+                    default=DEFAULTS["curriculum_n_max_end"],
+                    help="Upper bound of group count at curriculum completion "
+                         "(used by robust_curriculum_range)")
     g.add_argument("--dragon_lru_capacity", type=int, default=DEFAULTS["dragon_lru_capacity"])
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])

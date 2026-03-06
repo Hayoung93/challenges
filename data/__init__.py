@@ -60,6 +60,9 @@ def build_dataset(name: str, args, split: str = "train", epoch_state=None) -> Ba
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
             curriculum_ratio=getattr(args, "curriculum_ratio", 0.5),
+            curriculum_n_min=getattr(args, "curriculum_n_min", 2),
+            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
+            curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
         )
     else:
         transform = _get_inference_transform(args)
@@ -142,6 +145,12 @@ def _make_loader_kwargs(args, is_train: bool) -> dict:
 
     use_tta_collate = not is_train and _is_tta_prep_active(args)
     collate = _tta_collate_fn if use_tta_collate else _collate_fn
+
+    # Force batch_size=1 for TTA inference to prevent _tta_collate_fn's
+    # replicate padding from corrupting center crop positions when images
+    # have different native resolutions.
+    if use_tta_collate:
+        batch_size = 1
 
     kw = {
         "batch_size": batch_size,

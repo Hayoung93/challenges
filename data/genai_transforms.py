@@ -1122,6 +1122,211 @@ class RandomBlockDistortion:
         )
 
 
+class RandomMoire:
+    """Apply moire-pattern augmentation via sine-wave synthesis or real pattern blending.
+
+    When triggered (probability *p*), the transform selects **one** of two
+    strategies controlled by ``sine_ratio``:
+
+    * **Sine-wave mode** (default 70%): generates 2–3 overlapping sine waves
+      at random frequencies and angles, producing a procedural interference
+      pattern that is alpha-blended onto the image.
+    * **Bank-blend mode** (default 30%): loads a random moire pattern from a
+      pre-built image bank and composites it using one of three blend modes
+      (multiply / alpha / overlay), each with equal probability.
+
+    The two modes are mutually exclusive per call, preventing double-moire.
+
+    This transform should be placed **outside** ``GroupedNOfCompose`` as an
+    independent pipeline step, similar to ``RandomBlockDistortion``.
+
+    Args:
+        bank_dir: Path to the moire pattern bank directory containing
+            WebP images.  If ``None`` or non-existent, falls back to
+            100 % sine-wave mode.
+        sine_ratio: Fraction of activations that use sine-wave mode
+            (remainder uses bank-blend).
+        num_waves_range: ``(min, max)`` number of sine waves to overlay.
+        frequency_range: ``(min, max)`` spatial frequency in pixels per cycle.
+        angle_range: ``(min, max)`` wave angle in degrees.
+        sine_opacity_range: ``(min, max)`` alpha for sine-wave blending.
+        bank_opacity_range: ``(min, max)`` alpha / strength for bank blending.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(
+        self,
+        bank_dir: str | None = "/data/data/uniMoire/moire_bank/",
+        sine_ratio: float = 0.7,
+        num_waves_range: tuple[int, int] = (2, 4),
+        frequency_range: tuple[float, float] = (20.0, 120.0),
+        angle_range: tuple[float, float] = (0, 180),
+        sine_opacity_range: tuple[float, float] = (0.03, 0.15),
+        bank_opacity_range: tuple[float, float] = (0.05, 0.25),
+        p: float = 0.05,
+    ):
+        self.sine_ratio = sine_ratio
+        self.num_waves_range = num_waves_range
+        self.frequency_range = frequency_range
+        self.angle_range = angle_range
+        self.sine_opacity_range = sine_opacity_range
+        self.bank_opacity_range = bank_opacity_range
+        self.p = p
+
+        # Load bank images as compressed bytes for memory efficiency.
+        self._bank_bytes: list[bytes] = []
+        self._bank_available = False
+        if bank_dir is not None:
+            import os
+            import warnings
+
+            bank_path = os.path.expanduser(bank_dir)
+            if os.path.isdir(bank_path):
+                files = sorted(
+                    f for f in os.listdir(bank_path)
+                    if f.lower().endswith((".webp", ".png", ".jpg", ".jpeg"))
+                )
+                for fname in files:
+                    fpath = os.path.join(bank_path, fname)
+                    with open(fpath, "rb") as fh:
+                        self._bank_bytes.append(fh.read())
+                if self._bank_bytes:
+                    self._bank_available = True
+                else:
+                    warnings.warn(
+                        f"RandomMoire: bank_dir '{bank_dir}' contains no "
+                        f"images. Falling back to 100% sine-wave mode.",
+                        stacklevel=2,
+                    )
+            else:
+                warnings.warn(
+                    f"RandomMoire: bank_dir '{bank_dir}' not found. "
+                    f"Falling back to 100% sine-wave mode.",
+                    stacklevel=2,
+                )
+
+    # -- Sine-wave moire --------------------------------------------------
+
+    def _apply_sine(self, img: Image.Image) -> Image.Image:
+        arr = np.array(img, dtype=np.float32)
+        h, w = arr.shape[:2]
+
+        n_waves = random.randint(*self.num_waves_range)
+        pattern = np.zeros((h, w), dtype=np.float32)
+
+        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+
+        for _ in range(n_waves):
+            freq = random.uniform(*self.frequency_range)
+            angle_deg = random.uniform(*self.angle_range)
+            phase = random.uniform(0, 2 * np.pi)
+            angle_rad = np.radians(angle_deg)
+
+            # Project pixel coordinates onto wave direction.
+            proj = xs * np.cos(angle_rad) + ys * np.sin(angle_rad)
+            wave = np.sin(2 * np.pi * proj / freq + phase)
+            pattern += wave
+
+        # Normalize to [0, 1].
+        pmin, pmax = pattern.min(), pattern.max()
+        if pmax - pmin > 1e-6:
+            pattern = (pattern - pmin) / (pmax - pmin)
+        else:
+            pattern = np.full_like(pattern, 0.5)
+
+        # Optionally make it coloured (50 % chance).
+        if random.random() < 0.5:
+            color = np.array(
+                [random.uniform(0.5, 1.0) for _ in range(3)],
+                dtype=np.float32,
+            )
+            moire_rgb = pattern[:, :, None] * color[None, None, :] * 255.0
+        else:
+            moire_rgb = pattern[:, :, None] * 255.0
+
+        opacity = random.uniform(*self.sine_opacity_range)
+        blended = arr * (1 - opacity) + moire_rgb * opacity
+
+        return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+    # -- Bank-blend moire -------------------------------------------------
+
+    def _load_random_pattern(self, target_w: int, target_h: int) -> np.ndarray:
+        raw = random.choice(self._bank_bytes)
+        pat = Image.open(io.BytesIO(raw)).convert("RGB")
+
+        # Random flip / rotation for diversity.
+        if random.random() < 0.5:
+            pat = pat.transpose(Image.FLIP_LEFT_RIGHT)
+        if random.random() < 0.5:
+            pat = pat.transpose(Image.FLIP_TOP_BOTTOM)
+        rot = random.choice([0, 90, 180, 270])
+        if rot:
+            pat = pat.rotate(rot, expand=False)
+
+        pw, ph = pat.size
+        if pw >= target_w and ph >= target_h:
+            # Random crop.
+            x0 = random.randint(0, pw - target_w)
+            y0 = random.randint(0, ph - target_h)
+            pat = pat.crop((x0, y0, x0 + target_w, y0 + target_h))
+        else:
+            # Resize if pattern is smaller than target.
+            pat = pat.resize((target_w, target_h), Image.LANCZOS)
+
+        return np.array(pat, dtype=np.float32)
+
+    def _apply_bank(self, img: Image.Image) -> Image.Image:
+        arr = np.array(img, dtype=np.float32)
+        h, w = arr.shape[:2]
+        pat = self._load_random_pattern(w, h)
+        opacity = random.uniform(*self.bank_opacity_range)
+
+        mode = random.choice(["multiply", "alpha", "overlay"])
+
+        if mode == "multiply":
+            blended = arr * (pat / 255.0)
+            # Blend with original to control strength.
+            blended = arr * (1 - opacity) + blended * opacity
+
+        elif mode == "alpha":
+            blended = arr * (1 - opacity) + pat * opacity
+
+        else:  # overlay
+            base = arr / 255.0
+            blend = pat / 255.0
+            low = 2 * base * blend
+            high = 1 - 2 * (1 - base) * (1 - blend)
+            overlay = np.where(base < 0.5, low, high) * 255.0
+            blended = arr * (1 - opacity) + overlay * opacity
+
+        return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+    # -- Main entry -------------------------------------------------------
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        use_sine = (
+            random.random() < self.sine_ratio
+            or not self._bank_available
+        )
+
+        if use_sine:
+            return self._apply_sine(img)
+        return self._apply_bank(img)
+
+    def __repr__(self):
+        bank_info = len(self._bank_bytes) if self._bank_available else "N/A"
+        return (
+            f"{self.__class__.__name__}("
+            f"sine_ratio={self.sine_ratio}, "
+            f"bank_images={bank_info}, "
+            f"p={self.p})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Grouped composition operators for robust augmentation
 # ---------------------------------------------------------------------------
@@ -1178,44 +1383,90 @@ class GroupedNOfCompose:
 class CurricularGroupedNOfCompose:
     """Curriculum-aware variant of :class:`GroupedNOfCompose`.
 
-    The *upper bound* of selected groups increases linearly from ``n_min``
-    at epoch 0 to ``n_max`` at ``total_epochs * curriculum_ratio``.
-    The actual count each call is sampled uniformly from ``[1, upper]``.
+    The number of groups to apply each call is sampled uniformly from
+    ``[n_min, upper]``, where *upper* ramps linearly from ``n_max_start``
+    to ``n_max_end`` over the curriculum schedule.
+
+    ==============  ===========================================
+    Parameter       Role
+    ==============  ===========================================
+    ``n_min``       Fixed lower bound of the sampling range.
+    ``n_max_start`` Upper bound at epoch 0.
+    ``n_max_end``   Upper bound at curriculum completion.
+    ==============  ===========================================
+
+    For backward compatibility, the legacy ``(n_max, n_min)`` interface
+    is still accepted when ``n_max_start`` / ``n_max_end`` are omitted.
 
     Args:
         groups: Dict mapping group names to lists of transform instances.
         epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
             training loop.
         total_epochs: Total number of training epochs.
-        n_max: Maximum number of groups at full curriculum.
-        n_min: Starting number of groups at epoch 0.
+        n_min: Fixed lower bound for group count sampling.
+        n_max_start: Upper bound at epoch 0.
+        n_max_end: Upper bound when curriculum completes.
         curriculum_ratio: Fraction of total epochs over which the
-            curriculum ramps from ``n_min`` to ``n_max``.
+            upper bound ramps from ``n_max_start`` to ``n_max_end``.
+        n_max: **Deprecated** — legacy alias.  When ``n_max_start`` and
+            ``n_max_end`` are both ``None``, ``n_min`` and ``n_max``
+            fall back to the old behaviour (lower=1, upper=n_min→n_max).
     """
 
     def __init__(self, groups, epoch_state, total_epochs,
-                 n_max=5, n_min=2, curriculum_ratio=0.5):
+                 n_min=2, n_max_start=None, n_max_end=None,
+                 curriculum_ratio=0.5,
+                 # legacy compat
+                 n_max=None, n_start=None):
         self.groups = groups
         self.group_names = list(groups.keys())
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
-        self.n_max = n_max
-        self.n_min = n_min
         self.curriculum_ratio = curriculum_ratio
+
+        # --- resolve legacy / new params ---
+        if n_max_start is not None and n_max_end is not None:
+            # New-style params: use directly.
+            self.n_min = n_min
+            self.n_max_start = n_max_start
+            self.n_max_end = n_max_end
+            self._legacy = False
+        elif n_start is not None and n_max is not None:
+            # Transitional style (n_start / n_max).
+            self.n_min = n_min
+            self.n_max_start = n_start
+            self.n_max_end = n_max
+            self._legacy = False
+        elif n_max is not None:
+            # Pure legacy style (n_min / n_max, lower bound = 1).
+            self.n_min = n_min
+            self.n_max_start = n_min
+            self.n_max_end = n_max
+            self._legacy = True
+        else:
+            # Fallback defaults.
+            self.n_min = n_min
+            self.n_max_start = 3
+            self.n_max_end = 7
+            self._legacy = False
 
     def _get_n_upper(self):
         if self.total_epochs <= 1:
-            return self.n_max
+            return self.n_max_end
         curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
         progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
-        return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
+        return max(
+            self.n_max_start,
+            round(self.n_max_start + (self.n_max_end - self.n_max_start) * progress),
+        )
 
     def __call__(self, img: Image.Image) -> Image.Image:
         n_upper = min(self._get_n_upper(), len(self.group_names))
         if n_upper <= 0:
             return img
-        k = random.randint(1, n_upper)
+        n_lower = 1 if self._legacy else self.n_min
+        k = random.randint(n_lower, n_upper)
         selected_groups = random.sample(self.group_names, k)
         transforms = []
         for group_name in selected_groups:
@@ -1235,7 +1486,9 @@ class CurricularGroupedNOfCompose:
         group_info = {name: len(ts) for name, ts in self.groups.items()}
         return (
             f"{self.__class__.__name__}("
-            f"n_min={self.n_min}, n_max={self.n_max}, "
+            f"n_min={self.n_min}, "
+            f"n_max_start={self.n_max_start}, "
+            f"n_max_end={self.n_max_end}, "
             f"groups={group_info}, "
             f"total_epochs={self.total_epochs}, "
             f"curriculum_ratio={self.curriculum_ratio})"

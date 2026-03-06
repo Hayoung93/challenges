@@ -521,7 +521,7 @@ def main():
 
     # Wrap model with DDP or DataParallel
     if args.distributed:
-        model = DDP(model, device_ids=[args._local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[args._local_rank], find_unused_parameters=False)
         print_rank0("  Wrapped model with DistributedDataParallel", args)
     elif getattr(args, "dp", False) and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
