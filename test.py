@@ -243,6 +243,10 @@ def verify_checkpoint_config(checkpoint_path, current_args):
 
         print(f"\n{'!' * 60}\n")
 
+        answer = input("Continue with mismatched config? [y/N]: ").strip().lower()
+        if answer != "y":
+            raise SystemExit("Aborted by user due to checkpoint config mismatch.")
+
     return ckpt_args
 
 
