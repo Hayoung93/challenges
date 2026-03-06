@@ -7,6 +7,8 @@ from .genai_transforms import (
     CurricularNOfCompose,
     CurricularWrapper,
     GroupedNOfCompose,
+    IntensityGaussianBlur,
+    IntensityRandomPerspective,
     SkipIfClean,
     RandomBlockDistortion,
     RandomBoxBlur,
@@ -213,7 +215,7 @@ def _robust_artifact_groups() -> dict:
     """
     return {
         "blur": [
-            T.GaussianBlur(kernel_size=5, sigma=(0.1, 3.0)),
+            IntensityGaussianBlur(kernel_size=5, sigma=(0.1, 3.0)),
             RandomLensBlur(radius_range=(1, 6), p=1.0),
             RandomMotionBlur(kernel_size_range=(3, 15), p=1.0),
             RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
@@ -243,7 +245,7 @@ def _robust_artifact_groups() -> dict:
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
-            T.RandomPerspective(distortion_scale=0.3, p=1.0),
+            IntensityRandomPerspective(distortion_scale=0.3),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 3.0), p=1.0),
@@ -265,7 +267,7 @@ def _robust_artifact_groups_extended() -> dict:
     """
     return {
         "blur": [
-            T.GaussianBlur(kernel_size=5, sigma=(0.1, 10.0)),
+            IntensityGaussianBlur(kernel_size=5, sigma=(0.1, 10.0)),
             RandomLensBlur(radius_range=(1, 9), p=1.0),
             RandomMotionBlur(kernel_size_range=(3, 21), p=1.0),
             RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
@@ -295,7 +297,7 @@ def _robust_artifact_groups_extended() -> dict:
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
-            T.RandomPerspective(distortion_scale=0.3, p=1.0),
+            IntensityRandomPerspective(distortion_scale=0.3),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
@@ -530,6 +532,7 @@ def get_train_transform(
             weights=_ROBUST_GROUP_WEIGHTS,
             clean_p_start=0.5,
             clean_p_end=0.1,
+            intensity_curriculum=True,
         )
         return T.Compose(
             _robust_geometric(image_size)

@@ -18,6 +18,43 @@ from PIL import Image, ImageEnhance, ImageFilter
 from scipy.interpolate import PchipInterpolator
 
 
+# ---------------------------------------------------------------------------
+# Intensity-scaling helpers for curriculum-aware transforms
+# ---------------------------------------------------------------------------
+
+
+def _iscale_upper(rng, intensity):
+    """(a, b) where higher b = stronger effect.
+
+    At intensity=0 → (a, a), at intensity=1 → (a, b).
+    Example: std_range=(1.0, 25.0), intensity=0.5 → (1.0, 13.0)
+    """
+    a, b = rng
+    return (a, a + (b - a) * intensity)
+
+
+def _iscale_lower(rng, intensity):
+    """(a, b) where lower a = stronger effect.
+
+    At intensity=0 → (b, b), at intensity=1 → (a, b).
+    Example: quality_range=(10, 95), intensity=0.5 → (52, 95)
+    """
+    a, b = rng
+    return (b - (b - a) * intensity, b)
+
+
+def _iscale_neutral(rng, intensity, neutral):
+    """(a, b) symmetric around neutral point.
+
+    At intensity=0 → (neutral, neutral), at intensity=1 → (a, b).
+    Example: gamma_range=(0.3, 3.0), neutral=1.0, intensity=0.5
+             → (0.65, 2.0)
+    """
+    a, b = rng
+    return (neutral - (neutral - a) * intensity,
+            neutral + (b - neutral) * intensity)
+
+
 class RandomJPEGCompression:
     """Randomly compress image via JPEG at a random quality level.
 
@@ -32,11 +69,13 @@ class RandomJPEGCompression:
     def __init__(self, quality_range=(30, 95), p=0.5):
         self.quality_range = quality_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        quality = random.randint(*self.quality_range)
+        lo, hi = _iscale_lower(self.quality_range, self._intensity)
+        quality = random.randint(int(round(lo)), int(round(hi)))
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=quality)
         buffer.seek(0)
@@ -64,12 +103,14 @@ class RandomDownscaleUpscale:
     def __init__(self, scale_range=(0.5, 0.9), p=0.3):
         self.scale_range = scale_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         w, h = img.size
-        scale = random.uniform(*self.scale_range)
+        lo, hi = _iscale_lower(self.scale_range, self._intensity)
+        scale = random.uniform(lo, hi)
         new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
         down = img.resize((new_w, new_h), Image.BILINEAR)
         up = down.resize((w, h), Image.BILINEAR)
@@ -97,12 +138,14 @@ class RandomGaussianNoise:
     def __init__(self, std_range=(1.0, 10.0), p=0.3):
         self.std_range = std_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         arr = np.array(img, dtype=np.float32)
-        std = random.uniform(*self.std_range)
+        lo, hi = _iscale_upper(self.std_range, self._intensity)
+        std = random.uniform(lo, hi)
         noise = np.random.normal(0, std, arr.shape).astype(np.float32)
         arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
         return Image.fromarray(arr)
@@ -128,15 +171,17 @@ class RandomSaltPepperNoise:
     def __init__(self, amount=0.05, p=0.05):
         self.amount = amount
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         arr = np.array(img)
         h, w = arr.shape[:2]
+        effective_amount = self.amount * self._intensity
         mask = np.random.random((h, w))
-        arr[mask < self.amount / 2] = 255       # salt
-        arr[mask > 1 - self.amount / 2] = 0     # pepper
+        arr[mask < effective_amount / 2] = 255       # salt
+        arr[mask > 1 - effective_amount / 2] = 0     # pepper
         return Image.fromarray(arr)
 
     def __repr__(self):
@@ -161,14 +206,16 @@ class RandomImpulseNoise:
     def __init__(self, amount=0.05, p=0.03):
         self.amount = amount
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         arr = np.array(img)
+        effective_amount = self.amount * self._intensity
         mask = np.random.random(arr.shape)
-        arr[mask < self.amount / 2] = 255
-        arr[mask > 1 - self.amount / 2] = 0
+        arr[mask < effective_amount / 2] = 255
+        arr[mask > 1 - effective_amount / 2] = 0
         return Image.fromarray(arr)
 
     def __repr__(self):
@@ -371,11 +418,14 @@ class RandomMedianBlur:
     def __init__(self, kernel_sizes=(3, 5, 7), p=0.3):
         self.kernel_sizes = kernel_sizes
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        k = random.choice(self.kernel_sizes)
+        n = max(1, round(len(self.kernel_sizes) * self._intensity))
+        effective_sizes = self.kernel_sizes[:n]
+        k = random.choice(effective_sizes)
         return img.filter(ImageFilter.MedianFilter(size=k))
 
     def __repr__(self):
@@ -400,11 +450,13 @@ class RandomBoxBlur:
     def __init__(self, radius_range=(1, 3), p=0.3):
         self.radius_range = radius_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        r = random.randint(*self.radius_range)
+        lo, hi = _iscale_upper(self.radius_range, self._intensity)
+        r = random.randint(int(round(lo)), int(round(hi)))
         return img.filter(ImageFilter.BoxBlur(radius=r))
 
     def __repr__(self):
@@ -429,11 +481,13 @@ class RandomSharpen:
     def __init__(self, factor_range=(1.0, 3.0), p=0.3):
         self.factor_range = factor_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        factor = random.uniform(*self.factor_range)
+        lo, hi = _iscale_upper(self.factor_range, self._intensity)
+        factor = random.uniform(lo, hi)
         return ImageEnhance.Sharpness(img).enhance(factor)
 
     def __repr__(self):
@@ -459,12 +513,14 @@ class RandomPixelization:
     def __init__(self, ratio_range=(0.2, 0.8), p=0.2):
         self.ratio_range = ratio_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         w, h = img.size
-        ratio = random.uniform(*self.ratio_range)
+        lo, hi = _iscale_lower(self.ratio_range, self._intensity)
+        ratio = random.uniform(lo, hi)
         small_w, small_h = max(1, int(w * ratio)), max(1, int(h * ratio))
         small = img.resize((small_w, small_h), Image.NEAREST)
         return small.resize((w, h), Image.NEAREST)
@@ -594,6 +650,7 @@ class RandomLensBlur:
     def __init__(self, radius_range=(1, 6), p=0.3):
         self.radius_range = radius_range
         self.p = p
+        self._intensity = 1.0
 
     def _make_disk_kernel(self, radius):
         size = 2 * radius + 1
@@ -606,7 +663,8 @@ class RandomLensBlur:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        radius = random.randint(*self.radius_range)
+        lo, hi = _iscale_upper(self.radius_range, self._intensity)
+        radius = random.randint(int(round(lo)), int(round(hi)))
         kernel = self._make_disk_kernel(radius)
         arr = np.array(img, dtype=np.float64)
         for c in range(arr.shape[2]):
@@ -639,11 +697,13 @@ class RandomColorQuantization:
     def __init__(self, levels_range=(7, 20), p=0.3):
         self.levels_range = levels_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        levels = random.randint(*self.levels_range)
+        lo, hi = _iscale_lower(self.levels_range, self._intensity)
+        levels = random.randint(int(round(lo)), int(round(hi)))
         arr = np.array(img, dtype=np.float64)
         bins = np.linspace(0, 255, levels + 1)
         indices = np.digitize(arr, bins[1:-1])  # 0..levels-1
@@ -675,11 +735,13 @@ class RandomSpatialJitter:
         self.amount_range = amount_range
         self.iterations = iterations
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        amount = random.uniform(*self.amount_range)
+        lo, hi = _iscale_upper(self.amount_range, self._intensity)
+        amount = random.uniform(lo, hi)
         arr = np.array(img, dtype=np.float64)
         h, w = arr.shape[:2]
         for _ in range(self.iterations):
@@ -720,11 +782,13 @@ class RandomContrastCurve:
     def __init__(self, amount_range=(-0.4, 0.3), p=0.3):
         self.amount_range = amount_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        amount = random.uniform(*self.amount_range)
+        lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
+        amount = random.uniform(lo, hi)
         x_pts = np.array([0.0, 0.3, 0.5, 0.7, 1.0])
         y_pts = np.array([
             0.0,
@@ -761,6 +825,7 @@ class RandomBrightnessCurve:
     def __init__(self, amount_range=(-0.4, 0.5), p=0.3):
         self.amount_range = amount_range
         self.p = p
+        self._intensity = 1.0
 
     @staticmethod
     def _build_curve_lut(coef):
@@ -774,7 +839,8 @@ class RandomBrightnessCurve:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        amount = random.uniform(*self.amount_range)
+        lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
+        amount = random.uniform(lo, hi)
         if amount >= 0:
             coef = 0.5 + amount / 2
         else:
@@ -821,11 +887,13 @@ class RandomWebPCompression:
     def __init__(self, quality_range=(20, 95), p=0.3):
         self.quality_range = quality_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        quality = random.randint(*self.quality_range)
+        lo, hi = _iscale_lower(self.quality_range, self._intensity)
+        quality = random.randint(int(round(lo)), int(round(hi)))
         buffer = io.BytesIO()
         img.save(buffer, format="WEBP", quality=quality)
         buffer.seek(0)
@@ -853,6 +921,7 @@ class RandomMotionBlur:
     def __init__(self, kernel_size_range=(3, 15), p=0.3):
         self.kernel_size_range = kernel_size_range
         self.p = p
+        self._intensity = 1.0
 
     def _make_motion_kernel(self, size, angle):
         kernel = np.zeros((size, size), dtype=np.float64)
@@ -869,7 +938,8 @@ class RandomMotionBlur:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        min_s, max_s = self.kernel_size_range
+        lo, hi = _iscale_upper(self.kernel_size_range, self._intensity)
+        min_s, max_s = int(round(lo)), int(round(hi))
         # Ensure odd kernel size
         sizes = list(range(min_s | 1, max_s + 1, 2))
         if not sizes:
@@ -908,11 +978,13 @@ class RandomGammaCorrection:
     def __init__(self, gamma_range=(0.5, 2.0), p=0.3):
         self.gamma_range = gamma_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        gamma = random.uniform(*self.gamma_range)
+        lo, hi = _iscale_neutral(self.gamma_range, self._intensity, neutral=1.0)
+        gamma = random.uniform(lo, hi)
         lut = [int(((i / 255.0) ** gamma) * 255) for i in range(256)]
         return img.point(lut * 3)
 
@@ -940,12 +1012,14 @@ class RandomPosterize:
     def __init__(self, bits_range=(2, 6), p=0.3):
         self.bits_range = bits_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         from PIL import ImageOps
-        bits = random.randint(*self.bits_range)
+        lo, hi = _iscale_lower(self.bits_range, self._intensity)
+        bits = random.randint(int(round(lo)), int(round(hi)))
         return ImageOps.posterize(img, bits)
 
     def __repr__(self):
@@ -972,13 +1046,15 @@ class RandomChromaNoise:
     def __init__(self, std_range=(3.0, 20.0), p=0.3):
         self.std_range = std_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         ycbcr = img.convert("YCbCr")
         arr = np.array(ycbcr, dtype=np.float32)
-        std = random.uniform(*self.std_range)
+        lo, hi = _iscale_upper(self.std_range, self._intensity)
+        std = random.uniform(lo, hi)
         noise = np.random.normal(0, std, arr[:, :, 1:].shape).astype(np.float32)
         arr[:, :, 1:] += noise
         arr = np.clip(arr, 0, 255).astype(np.uint8)
@@ -1007,13 +1083,15 @@ class RandomLuminanceNoise:
     def __init__(self, std_range=(2.0, 15.0), p=0.3):
         self.std_range = std_range
         self.p = p
+        self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
         ycbcr = img.convert("YCbCr")
         arr = np.array(ycbcr, dtype=np.float32)
-        std = random.uniform(*self.std_range)
+        lo, hi = _iscale_upper(self.std_range, self._intensity)
+        std = random.uniform(lo, hi)
         noise = np.random.normal(0, std, arr[:, :, 0].shape).astype(np.float32)
         arr[:, :, 0] += noise
         arr = np.clip(arr, 0, 255).astype(np.uint8)
@@ -1477,6 +1555,7 @@ class CurricularGroupedNOfCompose:
                  weights=None,
                  clean_p_start: float = 0.0,
                  clean_p_end: float = 0.0,
+                 intensity_curriculum: bool = False,
                  # legacy compat
                  n_max=None, n_start=None):
         self.groups = groups
@@ -1486,6 +1565,7 @@ class CurricularGroupedNOfCompose:
         self.curriculum_ratio = curriculum_ratio
         self.clean_p_start = clean_p_start
         self.clean_p_end = clean_p_end
+        self.intensity_curriculum = intensity_curriculum
         self._weights = (
             [weights.get(name, 1.0) for name in self.group_names]
             if weights is not None else None
@@ -1551,6 +1631,7 @@ class CurricularGroupedNOfCompose:
         if n_upper <= 0:
             return img
         n_lower = 1 if self._legacy else self.n_min
+        n_lower = min(n_lower, n_upper)
         k = random.randint(n_lower, n_upper)
         if self._weights is not None:
             selected_groups = _weighted_sample(
@@ -1563,13 +1644,21 @@ class CurricularGroupedNOfCompose:
             t = random.choice(self.groups[group_name])
             transforms.append(t)
         random.shuffle(transforms)
+
+        progress = (self._get_progress()
+                    if self.intensity_curriculum else None)
+
         for t in transforms:
             original_p = getattr(t, "p", None)
             if original_p is not None:
                 t.p = 1.0
+            if progress is not None and hasattr(t, "_intensity"):
+                t._intensity = progress
             img = t(img)
             if original_p is not None:
                 t.p = original_p
+            if progress is not None and hasattr(t, "_intensity"):
+                t._intensity = 1.0
         return img
 
     def __repr__(self):
@@ -1584,8 +1673,84 @@ class CurricularGroupedNOfCompose:
             f"curriculum_ratio={self.curriculum_ratio}, "
             f"clean_p_start={self.clean_p_start}, "
             f"clean_p_end={self.clean_p_end}, "
+            f"intensity_curriculum={self.intensity_curriculum}, "
             f"weights={self._weights})"
         )
+
+
+class IntensityGaussianBlur:
+    """Intensity-aware Gaussian blur. Scales sigma range with _intensity.
+
+    kernel_size is fixed; sigma range is scaled via _iscale_upper.
+    """
+
+    def __init__(self, kernel_size=5, sigma=(0.1, 3.0), p=1.0):
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        lo, hi = _iscale_upper(self.sigma, self._intensity)
+        chosen_sigma = random.uniform(lo, max(lo, hi))
+        return TF.gaussian_blur(img, self.kernel_size, [chosen_sigma, chosen_sigma])
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}("
+                f"kernel_size={self.kernel_size}, sigma={self.sigma}, "
+                f"p={self.p})")
+
+
+class IntensityRandomPerspective:
+    """Intensity-aware perspective distortion. Scales distortion_scale with _intensity."""
+
+    def __init__(self, distortion_scale=0.3, p=1.0):
+        self.distortion_scale = distortion_scale
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        effective_scale = self.distortion_scale * self._intensity
+        if effective_scale < 1e-6:
+            return img
+        startpoints, endpoints = self._get_params(img.size, effective_scale)
+        return TF.perspective(
+            img, startpoints, endpoints,
+            interpolation=TF.InterpolationMode.BILINEAR,
+        )
+
+    @staticmethod
+    def _get_params(img_size, distortion_scale):
+        """T.RandomPerspective.get_params() equivalent."""
+        w, h = img_size
+        half_h, half_w = h / 2, w / 2
+        tl = [
+            int(random.uniform(0, distortion_scale * half_w)),
+            int(random.uniform(0, distortion_scale * half_h)),
+        ]
+        tr = [
+            int(w - random.uniform(0, distortion_scale * half_w)),
+            int(random.uniform(0, distortion_scale * half_h)),
+        ]
+        br = [
+            int(w - random.uniform(0, distortion_scale * half_w)),
+            int(h - random.uniform(0, distortion_scale * half_h)),
+        ]
+        bl = [
+            int(random.uniform(0, distortion_scale * half_w)),
+            int(h - random.uniform(0, distortion_scale * half_h)),
+        ]
+        startpoints = [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]
+        endpoints = [tl, tr, br, bl]
+        return startpoints, endpoints
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}("
+                f"distortion_scale={self.distortion_scale}, p={self.p})")
 
 
 class SkipIfClean:
