@@ -158,6 +158,95 @@ def print_metrics(metrics, subset_name="val"):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Checkpoint config verification
+# ═══════════════════════════════════════════════════════════════════
+
+
+# Keys that affect model architecture — mismatch likely causes errors or silent bugs.
+_CRITICAL_KEYS = [
+    ("model_name",   "Model architecture"),
+    ("num_classes",  "Number of classes"),
+    ("lora_enabled", "LoRA enabled"),
+    ("wsgm",         "WSGM enabled"),
+]
+
+# Keys that affect inference quality — mismatch may degrade results.
+_WARN_KEYS = [
+    ("image_size",            "Image size"),
+    ("lora_rank",             "LoRA rank"),
+    ("lora_alpha",            "LoRA alpha"),
+    ("lora_dropout",          "LoRA dropout"),
+    ("lora_target_modules",   "LoRA target modules"),
+    ("wsgm_reduction_factor", "WSGM reduction factor"),
+    ("wsgm_dropout",          "WSGM dropout"),
+    ("wsgm_aggregation",      "WSGM aggregation"),
+    ("drop_rate",             "Dropout rate"),
+    ("projection_dim",        "Projection dim"),
+]
+
+
+def _fmt_val(v):
+    """Format a value for display, handling lists and bools."""
+    if isinstance(v, list):
+        return str(v) if v else "(empty)"
+    return str(v)
+
+
+def verify_checkpoint_config(checkpoint_path, current_args):
+    """Load checkpoint metadata and warn if current args differ from training args.
+
+    Prints CRITICAL warnings for architecture mismatches (model_name, LoRA,
+    WSGM, num_classes) and regular warnings for other settings (image_size,
+    LoRA hyperparams, etc.).  Returns the checkpoint training args dict, or
+    None if the checkpoint contains no saved args.
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt_args = ckpt.get("args")
+    if ckpt_args is None:
+        print("NOTE: Checkpoint does not contain saved training args — "
+              "skipping config verification.")
+        return None
+
+    critical_mismatches = []
+    warn_mismatches = []
+
+    for key, label in _CRITICAL_KEYS:
+        ckpt_val = ckpt_args.get(key)
+        cur_val = getattr(current_args, key, None)
+        if ckpt_val is not None and cur_val is not None and ckpt_val != cur_val:
+            critical_mismatches.append((label, key, ckpt_val, cur_val))
+
+    for key, label in _WARN_KEYS:
+        ckpt_val = ckpt_args.get(key)
+        cur_val = getattr(current_args, key, None)
+        if ckpt_val is not None and cur_val is not None and ckpt_val != cur_val:
+            warn_mismatches.append((label, key, ckpt_val, cur_val))
+
+    if critical_mismatches or warn_mismatches:
+        print(f"\n{'!' * 60}")
+        print("  Checkpoint config mismatch detected!")
+        print(f"{'!' * 60}")
+
+        if critical_mismatches:
+            print("\n  CRITICAL (architecture mismatch — may cause errors):")
+            for label, key, ckpt_val, cur_val in critical_mismatches:
+                print(f"    {label} ({key}):")
+                print(f"      checkpoint = {_fmt_val(ckpt_val)}")
+                print(f"      current    = {_fmt_val(cur_val)}")
+
+        if warn_mismatches:
+            print("\n  WARNING (may affect inference quality):")
+            for label, key, ckpt_val, cur_val in warn_mismatches:
+                print(f"    {label} ({key}):")
+                print(f"      checkpoint = {_fmt_val(ckpt_val)}")
+                print(f"      current    = {_fmt_val(cur_val)}")
+
+        print(f"\n{'!' * 60}\n")
+
+    return ckpt_args
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
@@ -194,6 +283,9 @@ def main():
     # Resolve output directory: {output_dir}/{log_name}/
     log_name = get_log_name(args.checkpoint_path)
     args.output_dir = os.path.join(args.output_dir, log_name)
+
+    # Verify checkpoint config against current args
+    ckpt_args = verify_checkpoint_config(args.checkpoint_path, args)
 
     # Model
     print(f"Model: {args.model_name}")
