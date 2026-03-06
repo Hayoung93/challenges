@@ -1332,6 +1332,28 @@ class RandomMoire:
 # ---------------------------------------------------------------------------
 
 
+def _weighted_sample(names, weights, k):
+    """Sample *k* items from *names* without replacement using *weights*.
+
+    Uses sequential weighted draws: at each step one name is chosen
+    proportionally to its weight, then removed from the pool.
+    """
+    pool = list(range(len(names)))
+    w = list(weights)
+    selected = []
+    for _ in range(k):
+        total = sum(w[i] for i in pool)
+        r = random.random() * total
+        cum = 0.0
+        for j, idx in enumerate(pool):
+            cum += w[idx]
+            if cum >= r:
+                selected.append(names[idx])
+                pool.pop(j)
+                break
+    return selected
+
+
 class GroupedNOfCompose:
     """Select 1–N groups, pick 1 transform per group, apply in random order.
 
@@ -1345,19 +1367,41 @@ class GroupedNOfCompose:
     Args:
         groups: Dict mapping group names to lists of transform instances.
         n: Maximum number of groups to select per call.
+        weights: Optional dict mapping group names to sampling weights.
+            Groups not listed default to 1.0.  Higher weight = more
+            likely to be selected.  When ``None``, uniform sampling.
+        clean_p: Probability of skipping all artifact transforms and
+            returning the image unchanged (clean pass-through).
+            Default ``0.0`` preserves the original behaviour.
     """
 
-    def __init__(self, groups: dict, n: int = 4):
+    def __init__(self, groups: dict, n: int = 4,
+                 weights: dict | None = None,
+                 clean_p: float = 0.0):
         self.groups = groups
         self.group_names = list(groups.keys())
         self.n = n
+        self.clean_p = clean_p
+        self._weights = (
+            [weights.get(name, 1.0) for name in self.group_names]
+            if weights is not None else None
+        )
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        if self.clean_p > 0.0 and random.random() < self.clean_p:
+            self._last_clean = True
+            return img
+        self._last_clean = False
         n_upper = min(self.n, len(self.group_names))
         if n_upper <= 0:
             return img
         k = random.randint(1, n_upper)
-        selected_groups = random.sample(self.group_names, k)
+        if self._weights is not None:
+            selected_groups = _weighted_sample(
+                self.group_names, self._weights, k,
+            )
+        else:
+            selected_groups = random.sample(self.group_names, k)
         transforms = []
         for group_name in selected_groups:
             t = random.choice(self.groups[group_name])
@@ -1376,7 +1420,9 @@ class GroupedNOfCompose:
         group_info = {name: len(ts) for name, ts in self.groups.items()}
         return (
             f"{self.__class__.__name__}("
-            f"n={self.n}, groups={group_info})"
+            f"n={self.n}, groups={group_info}, "
+            f"clean_p={self.clean_p}, "
+            f"weights={self._weights})"
         )
 
 
@@ -1387,12 +1433,20 @@ class CurricularGroupedNOfCompose:
     ``[n_min, upper]``, where *upper* ramps linearly from ``n_max_start``
     to ``n_max_end`` over the curriculum schedule.
 
+    A *clean pass-through* probability can also follow the curriculum:
+    ``clean_p_start`` at epoch 0 decreases linearly to ``clean_p_end``
+    at curriculum completion.  When triggered the artifact transforms
+    are skipped entirely, letting the model see unperturbed images.
+
     ==============  ===========================================
     Parameter       Role
     ==============  ===========================================
     ``n_min``       Fixed lower bound of the sampling range.
     ``n_max_start`` Upper bound at epoch 0.
     ``n_max_end``   Upper bound at curriculum completion.
+    ``clean_p_start`` Clean pass-through probability at epoch 0.
+    ``clean_p_end``   Clean pass-through probability at curriculum
+                      completion (and beyond).
     ==============  ===========================================
 
     For backward compatibility, the legacy ``(n_max, n_min)`` interface
@@ -1408,6 +1462,10 @@ class CurricularGroupedNOfCompose:
         n_max_end: Upper bound when curriculum completes.
         curriculum_ratio: Fraction of total epochs over which the
             upper bound ramps from ``n_max_start`` to ``n_max_end``.
+        clean_p_start: Clean pass-through probability at epoch 0.
+            Default ``0.0`` preserves the original behaviour.
+        clean_p_end: Clean pass-through probability at curriculum
+            completion.  Default ``0.0``.
         n_max: **Deprecated** — legacy alias.  When ``n_max_start`` and
             ``n_max_end`` are both ``None``, ``n_min`` and ``n_max``
             fall back to the old behaviour (lower=1, upper=n_min→n_max).
@@ -1416,6 +1474,9 @@ class CurricularGroupedNOfCompose:
     def __init__(self, groups, epoch_state, total_epochs,
                  n_min=2, n_max_start=None, n_max_end=None,
                  curriculum_ratio=0.5,
+                 weights=None,
+                 clean_p_start: float = 0.0,
+                 clean_p_end: float = 0.0,
                  # legacy compat
                  n_max=None, n_start=None):
         self.groups = groups
@@ -1423,6 +1484,12 @@ class CurricularGroupedNOfCompose:
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
         self.curriculum_ratio = curriculum_ratio
+        self.clean_p_start = clean_p_start
+        self.clean_p_end = clean_p_end
+        self._weights = (
+            [weights.get(name, 1.0) for name in self.group_names]
+            if weights is not None else None
+        )
 
         # --- resolve legacy / new params ---
         if n_max_start is not None and n_max_end is not None:
@@ -1450,24 +1517,47 @@ class CurricularGroupedNOfCompose:
             self.n_max_end = 7
             self._legacy = False
 
-    def _get_n_upper(self):
+    def _get_progress(self):
+        """Return curriculum progress in [0, 1]."""
         if self.total_epochs <= 1:
-            return self.n_max_end
+            return 1.0
         curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        if curriculum_epochs <= 1:
+            return 1.0
         progress = self.epoch_state.value / (curriculum_epochs - 1)
-        progress = min(max(progress, 0.0), 1.0)
+        return min(max(progress, 0.0), 1.0)
+
+    def _get_n_upper(self):
+        progress = self._get_progress()
         return max(
             self.n_max_start,
             round(self.n_max_start + (self.n_max_end - self.n_max_start) * progress),
         )
 
+    def _get_clean_p(self):
+        """Return current clean pass-through probability."""
+        if self.clean_p_start == 0.0 and self.clean_p_end == 0.0:
+            return 0.0
+        progress = self._get_progress()
+        return self.clean_p_start + (self.clean_p_end - self.clean_p_start) * progress
+
     def __call__(self, img: Image.Image) -> Image.Image:
+        clean_p = self._get_clean_p()
+        if clean_p > 0.0 and random.random() < clean_p:
+            self._last_clean = True
+            return img
+        self._last_clean = False
         n_upper = min(self._get_n_upper(), len(self.group_names))
         if n_upper <= 0:
             return img
         n_lower = 1 if self._legacy else self.n_min
         k = random.randint(n_lower, n_upper)
-        selected_groups = random.sample(self.group_names, k)
+        if self._weights is not None:
+            selected_groups = _weighted_sample(
+                self.group_names, self._weights, k,
+            )
+        else:
+            selected_groups = random.sample(self.group_names, k)
         transforms = []
         for group_name in selected_groups:
             t = random.choice(self.groups[group_name])
@@ -1491,5 +1581,38 @@ class CurricularGroupedNOfCompose:
             f"n_max_end={self.n_max_end}, "
             f"groups={group_info}, "
             f"total_epochs={self.total_epochs}, "
-            f"curriculum_ratio={self.curriculum_ratio})"
+            f"curriculum_ratio={self.curriculum_ratio}, "
+            f"clean_p_start={self.clean_p_start}, "
+            f"clean_p_end={self.clean_p_end}, "
+            f"weights={self._weights})"
+        )
+
+
+class SkipIfClean:
+    """Skip *transform* when the upstream compose triggered clean pass-through.
+
+    Reads ``source._last_clean`` set by :class:`GroupedNOfCompose` or
+    :class:`CurricularGroupedNOfCompose`.  When the flag is ``True``
+    the wrapped transform is skipped, keeping the image artifact-free.
+
+    Args:
+        source: The upstream compose instance whose ``_last_clean``
+            attribute is checked each call.
+        transform: Transform to apply when not in clean mode.
+    """
+
+    def __init__(self, source, transform):
+        self.source = source
+        self.transform = transform
+
+    def __call__(self, img):
+        if getattr(self.source, "_last_clean", False):
+            return img
+        return self.transform(img)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"source={self.source.__class__.__name__}, "
+            f"transform={self.transform})"
         )

@@ -7,6 +7,7 @@ from .genai_transforms import (
     CurricularNOfCompose,
     CurricularWrapper,
     GroupedNOfCompose,
+    SkipIfClean,
     RandomBlockDistortion,
     RandomBoxBlur,
     RandomMoire,
@@ -181,6 +182,24 @@ def _augly_artifact_pool() -> list:
     ]
 
 
+def _robust_geometric(image_size: int, crop_p: float = 0.5) -> list:
+    """Geometric + color augmentations for robust pipelines.
+
+    Same as :func:`_genai_geometric` but with rotation applied at only
+    2.5 % probability instead of 100 %, to avoid destroying pixel-level
+    artifacts that robust augmentation is designed to preserve.
+    """
+    return [
+        RandomResizeOrCrop(image_size, crop_p=crop_p, scale=(0.5, 1.0)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.1),
+        T.RandomApply([T.RandomRotation(degrees=15)], p=0.025),
+        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+        T.RandomGrayscale(p=0.1),
+        T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+    ]
+
+
 def _robust_artifact_groups() -> dict:
     """Build grouped artifact transforms for robust N-of-K composition.
 
@@ -225,7 +244,6 @@ def _robust_artifact_groups() -> dict:
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
             T.RandomPerspective(distortion_scale=0.3, p=1.0),
-            T.RandomRotation(degrees=15),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 3.0), p=1.0),
@@ -278,7 +296,6 @@ def _robust_artifact_groups_extended() -> dict:
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
             T.RandomPerspective(distortion_scale=0.3, p=1.0),
-            T.RandomRotation(degrees=15),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
@@ -286,6 +303,15 @@ def _robust_artifact_groups_extended() -> dict:
             RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
         ],
     }
+
+
+# Group sampling weights for robust pipelines.
+# Groups not listed default to 1.0 (uniform).
+_ROBUST_GROUP_WEIGHTS = {
+    "color": 0.25,
+    "spatial": 0.5,
+    "sharpness_brightness": 0.5,
+}
 
 
 def _to_tensor_normalize() -> list:
@@ -432,52 +458,61 @@ def get_train_transform(
             + _to_tensor_normalize()
         )
     elif augmentation == "robust":
+        artifact_compose = GroupedNOfCompose(
+            _robust_artifact_groups(), n=4,
+            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
+        )
         return T.Compose(
-            _genai_geometric(image_size)
-            + [GroupedNOfCompose(_robust_artifact_groups(), n=4)]
-            + [RandomBlockDistortion(p=0.05)]
-            + [RandomMoire(p=0.05)]
+            _robust_geometric(image_size)
+            + [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
     elif augmentation == "robust_curriculum":
         if epoch_state is None:
             import multiprocessing
             epoch_state = multiprocessing.Value("i", 0)
+        artifact_compose = CurricularGroupedNOfCompose(
+            _robust_artifact_groups(),
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            n_min=2,
+            n_max_start=2,
+            n_max_end=5,
+            curriculum_ratio=curriculum_ratio,
+            weights=_ROBUST_GROUP_WEIGHTS,
+            clean_p_start=0.5,
+            clean_p_end=0.1,
+        )
         return T.Compose(
-            _genai_geometric(image_size)
-            + [
-                CurricularGroupedNOfCompose(
-                    _robust_artifact_groups(),
-                    epoch_state=epoch_state,
-                    total_epochs=total_epochs,
-                    n_max=5,
-                    n_min=2,
-                    curriculum_ratio=curriculum_ratio,
-                ),
-            ]
-            + [RandomBlockDistortion(p=0.05)]
-            + [RandomMoire(p=0.05)]
+            _robust_geometric(image_size)
+            + [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
     elif augmentation == "robust_curriculum_range":
         if epoch_state is None:
             import multiprocessing
             epoch_state = multiprocessing.Value("i", 0)
+        artifact_compose = CurricularGroupedNOfCompose(
+            _robust_artifact_groups_extended(),
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            n_min=curriculum_n_min,
+            n_max_start=curriculum_n_max_start,
+            n_max_end=curriculum_n_max_end,
+            curriculum_ratio=curriculum_ratio,
+            weights=_ROBUST_GROUP_WEIGHTS,
+            clean_p_start=0.5,
+            clean_p_end=0.1,
+        )
         return T.Compose(
-            _genai_geometric(image_size)
-            + [
-                CurricularGroupedNOfCompose(
-                    _robust_artifact_groups_extended(),
-                    epoch_state=epoch_state,
-                    total_epochs=total_epochs,
-                    n_min=curriculum_n_min,
-                    n_max_start=curriculum_n_max_start,
-                    n_max_end=curriculum_n_max_end,
-                    curriculum_ratio=curriculum_ratio,
-                ),
-            ]
-            + [RandomBlockDistortion(p=0.08)]
-            + [RandomMoire(p=0.08)]
+            _robust_geometric(image_size)
+            + [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.08))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
             + _to_tensor_normalize()
         )
     else:
