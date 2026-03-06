@@ -307,7 +307,7 @@ python train.py --label_smoothing 0.0   # 비활성화
     "optimizer": dict,         # optimizer.state_dict()
     "scheduler": dict,         # scheduler.state_dict()
     "scaler": dict,            # GradScaler.state_dict()
-    "best_val_acc": float,     # 최고 validation accuracy
+    "best_val_auc": float,     # 최고 validation AUC (이전 checkpoint의 "best_val_acc"도 호환)
     "args": dict,              # 전체 하이퍼파라미터 스냅샷
 }
 ```

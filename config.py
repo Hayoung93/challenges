@@ -90,6 +90,12 @@ DEFAULTS = {
     "label_smoothing": 0.1,
     "resume": "",
 
+    # TensorBoard image logging
+    "tb_log_images": True,
+    "tb_log_images_per_epoch": 5,  # how many times per epoch to log input images
+    "tb_log_images_count": 8,     # images per grid (single-view)
+    "tb_log_images_pairs": 4,     # pairs per grid (multi-view)
+
     # Multi-view consistency training
     "multi_view": False,
     "lambda_con": 0.1,        # Supervised contrastive loss weight
@@ -282,6 +288,21 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Label smoothing factor for CrossEntropyLoss")
     g.add_argument("--resume", type=str, default=DEFAULTS["resume"],
                     help="Path to checkpoint to resume training from")
+    # TensorBoard image logging
+    g.add_argument("--tb_log_images", action="store_true",
+                    default=DEFAULTS["tb_log_images"],
+                    help="Log augmented training images to TensorBoard")
+    g.add_argument("--no_tb_log_images", dest="tb_log_images",
+                    action="store_false")
+    g.add_argument("--tb_log_images_per_epoch", type=int,
+                    default=DEFAULTS["tb_log_images_per_epoch"],
+                    help="Number of times per epoch to log input images")
+    g.add_argument("--tb_log_images_count", type=int,
+                    default=DEFAULTS["tb_log_images_count"],
+                    help="Number of images per grid (single-view)")
+    g.add_argument("--tb_log_images_pairs", type=int,
+                    default=DEFAULTS["tb_log_images_pairs"],
+                    help="Number of augmented/clean pairs per grid (multi-view)")
     # Multi-view consistency
     g.add_argument("--multi_view", action="store_true",
                     default=DEFAULTS["multi_view"],

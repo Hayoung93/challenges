@@ -302,12 +302,13 @@ def build_train_val_loaders(
             curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
+            clean_view=True,
         )
         for name in dataset_names:
             train_transform_datasets[name] = MultiViewDataset(
                 train_transform_datasets[name], transform2,
             )
-        print("  [multi_view] Enabled: two independent views per sample")
+        print("  [multi_view] Enabled: view1=augmented, view2=clean (geometric-only)")
 
     if dataset_mode == "concat":
         combined_train = ConcatDataset(list(train_transform_datasets.values()))

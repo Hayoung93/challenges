@@ -332,6 +332,7 @@ def get_train_transform(
     curriculum_n_max_start: int = 3,
     curriculum_n_max_end: int = 7,
     scale_state=None,
+    clean_view: bool = False,
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -353,6 +354,9 @@ def get_train_transform(
         scale_state: ``multiprocessing.Value('i', ...)`` holding the
             current target resolution for multi-scale training.
             When provided, returns a :class:`MultiscaleTransformWrapper`.
+        clean_view: When ``True``, returns the geometric-only variant
+            of the requested augmentation (no artifact transforms).
+            Used by multi-view training to provide a clean anchor view.
     """
     # Multi-scale: wrap with dynamic resolution dispatch
     if scale_state is not None:
@@ -367,8 +371,27 @@ def get_train_transform(
                 curriculum_n_max_start=curriculum_n_max_start,
                 curriculum_n_max_end=curriculum_n_max_end,
                 scale_state=None,  # prevent recursion
+                clean_view=clean_view,
             )
         return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
+
+    # Clean view: return geometric-only variant (no artifact transforms).
+    # Used by multi-view training to provide a clean anchor view.
+    if clean_view:
+        _GEOMETRIC_MAP = {
+            "robust": _robust_geometric,
+            "robust_curriculum": _robust_geometric,
+            "robust_curriculum_range": _robust_geometric,
+            "genai": _genai_geometric,
+            "genai_curriculum": _genai_geometric,
+            "augly": _genai_geometric,
+            "augly_curriculum": _genai_geometric,
+        }
+        geo_fn = _GEOMETRIC_MAP.get(augmentation)
+        if geo_fn is not None:
+            return T.Compose(geo_fn(image_size) + _to_tensor_normalize())
+        # For other types (none, default, strong) fall through — they
+        # are already artifact-free.
 
     if augmentation == "none":
         return T.Compose([

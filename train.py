@@ -238,6 +238,46 @@ def vram_precheck(
         raise SystemExit(1)
 
 
+def _log_training_images(
+    writer: SummaryWriter,
+    global_step: int,
+    images: torch.Tensor,
+    clean_images: torch.Tensor | None,
+    count: int,
+) -> None:
+    """Log a grid of training input images to TensorBoard.
+
+    For multi-view training, ``images`` is the augmented view and
+    ``clean_images`` is the clean (geometric-only) view.  The two are
+    rendered as a vertically-stacked grid (augmented on top, clean on
+    bottom) so that each column forms a visual pair.
+
+    Images are denormalized from ImageNet stats before logging.
+    """
+    from torchvision.utils import make_grid
+
+    from data.transforms import IMAGENET_MEAN, IMAGENET_STD
+
+    mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+
+    def denorm(x: torch.Tensor) -> torch.Tensor:
+        return (x.detach().cpu().float() * std + mean).clamp(0, 1)
+
+    if clean_images is not None:
+        # Multi-view: augmented on top, clean on bottom
+        n = min(count, images.size(0))
+        aug_grid = make_grid(denorm(images[:n]), nrow=n, padding=2)
+        clean_grid = make_grid(denorm(clean_images[:n]), nrow=n, padding=2)
+        paired = torch.cat([aug_grid, clean_grid], dim=1)
+        writer.add_image("train/input_paired", paired, global_step)
+    else:
+        n = min(count, images.size(0))
+        nrow = min(n, 4)
+        grid = make_grid(denorm(images[:n]), nrow=nrow, padding=2)
+        writer.add_image("train/input_images", grid, global_step)
+
+
 class AverageMeter:
     """Computes and stores a running average."""
 
@@ -366,6 +406,8 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     args,
+    *,
+    writer: SummaryWriter | None = None,
 ) -> dict:
     """Train for one epoch. Returns dict with 'loss' and 'accuracy'.
 
@@ -373,6 +415,9 @@ def train_one_epoch(
     ``(view1, view2, labels, metadata)`` and sub-loss components
     (``loss_ce``, ``loss_supcon``, ``loss_mvc``) are included in
     the returned dict.
+
+    When *writer* is not None, augmented input images are logged to
+    TensorBoard ``tb_log_images_per_epoch`` times during the epoch.
     """
     model.train()
     loss_meter = AverageMeter()
@@ -383,15 +428,32 @@ def train_one_epoch(
     if use_multi_view:
         sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
 
+    # Image logging schedule: compute which batch indices to log at
+    _img_log_steps: set[int] = set()
+    if writer is not None and getattr(args, "tb_log_images", True):
+        n_logs = getattr(args, "tb_log_images_per_epoch", 5)
+        total_batches = len(loader)
+        if total_batches > 0 and n_logs > 0:
+            interval = max(total_batches // n_logs, 1)
+            _img_log_steps = {i * interval for i in range(n_logs)}
+
     pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False,
                 disable=not is_main_process(args))
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         if use_multi_view:
             views1, views2, labels, _metadata = batch
             views1 = views1.to(device, non_blocking=True)
             views2 = views2.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             batch_size = views1.size(0)
+
+            # Log augmented/clean pairs to TensorBoard
+            if batch_idx in _img_log_steps:
+                global_step = epoch * len(loader) + batch_idx
+                _log_training_images(
+                    writer, global_step, views1, views2,
+                    count=getattr(args, "tb_log_images_pairs", 4),
+                )
 
             with autocast(device_type="cuda", enabled=args.amp):
                 logits1, _, proj1 = model(views1, return_embedding=True)
@@ -408,6 +470,14 @@ def train_one_epoch(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             batch_size = images.size(0)
+
+            # Log augmented images to TensorBoard
+            if batch_idx in _img_log_steps:
+                global_step = epoch * len(loader) + batch_idx
+                _log_training_images(
+                    writer, global_step, images, None,
+                    count=getattr(args, "tb_log_images_count", 8),
+                )
 
             with autocast(device_type="cuda", enabled=args.amp):
                 logits = model(images)
@@ -749,7 +819,7 @@ def main():
 
     # Early stopping
     early_stopping = EarlyStopping(patience=args.early_stopping_patience)
-    if args.resume and best_val_acc > 0:
+    if args.resume and best_val_auc > 0:
         early_stopping.best_score = best_val_auc
         early_stopping.best_epoch = start_epoch - 1
 
@@ -796,6 +866,7 @@ def main():
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler,
             scaler, device, epoch, args,
+            writer=writer,
         )
 
         if writer is not None:
