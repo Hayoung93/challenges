@@ -151,6 +151,7 @@ class GenAIClassifier(nn.Module):
         wsgm_reduction_factor: int = 4,
         wsgm_dropout: float = 0.5,
         wsgm_aggregation: str = "average",
+        projection_dim: int = 0,
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -188,6 +189,9 @@ class GenAIClassifier(nn.Module):
                 create_kwargs["resolution"] = image_size
             self.backbone = create_model(model_name, **create_kwargs)
             num_features = self.backbone.head.in_features
+
+        # Store feature dimension for projection head construction below.
+        self._num_features = num_features
 
         # WSGM wraps the backbone with its own classifier head;
         # otherwise replace the head normally.
@@ -234,6 +238,19 @@ class GenAIClassifier(nn.Module):
 
         if checkpoint_path:
             self._load_checkpoint(checkpoint_path)
+
+        # Projection head for contrastive learning (used only during training).
+        # For WSGM, the embedding dim is the wrapper's final_dim.
+        feat_dim = self.backbone.embed_dim if wsgm else self._num_features
+        self.projection_dim = projection_dim
+        if projection_dim > 0:
+            self.projection_head = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(feat_dim, projection_dim),
+            )
+        else:
+            self.projection_head = None
 
     def _freeze_backbone(self):
         """Freeze all parameters except the classification head (and LoRA)."""
@@ -332,16 +349,40 @@ class GenAIClassifier(nn.Module):
                 "\n  ".join(result.unexpected_keys),
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_embedding: bool = False,
+    ) -> torch.Tensor | tuple:
         """Forward pass.
 
         Args:
             x: Input tensor of shape ``(B, 3, H, W)``.
+            return_embedding: If True, also return the embedding and
+                optional projection.
 
         Returns:
-            Logits of shape ``(B, num_classes)``.
+            Logits ``(B, num_classes)`` when ``return_embedding=False``.
+            ``(logits, embedding, projection)`` when ``return_embedding=True``,
+            where *projection* is ``None`` if no projection head is configured.
         """
-        return self.backbone(x)
+        if not return_embedding:
+            return self.backbone(x)
+
+        # Extract embedding and logits separately per backbone type.
+        if self.wsgm_enabled:
+            logits, embedding = self.backbone.forward_with_embedding(x)
+        elif self.model_name in _DINOV3_WEIGHTS:
+            ret = self.backbone.forward_features(x)
+            embedding = ret["x_norm_clstoken"]
+            logits = self.backbone.head(embedding)
+        else:  # MambaVision
+            embedding = self.backbone.forward_features(x)
+            logits = self.backbone.head(embedding)
+
+        projection = None
+        if self.projection_head is not None:
+            projection = self.projection_head(embedding)
+
+        return logits, embedding, projection
 
 
 def build_model(args) -> GenAIClassifier:
@@ -371,4 +412,5 @@ def build_model(args) -> GenAIClassifier:
         wsgm_reduction_factor=getattr(args, "wsgm_reduction_factor", 4),
         wsgm_dropout=getattr(args, "wsgm_dropout", 0.5),
         wsgm_aggregation=getattr(args, "wsgm_aggregation", "average"),
+        projection_dim=getattr(args, "projection_dim", 0),
     )

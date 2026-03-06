@@ -254,21 +254,38 @@ class WSGMWrapper(nn.Module):
     # Unified forward
     # ------------------------------------------------------------------
 
+    def _aggregate(self, wsgm_outputs: List[torch.Tensor]) -> torch.Tensor:
+        """Aggregate WSGM outputs and apply post-norm."""
+        if self.aggregation == "average":
+            feat = torch.stack(wsgm_outputs, dim=0).mean(dim=0)
+        else:  # concat
+            feat = torch.cat(wsgm_outputs, dim=-1)
+            feat = self.concat_proj(feat)
+        return self.ln_post(feat)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.arch_type == "vit":
             wsgm_outputs = self._forward_vit(x)
         else:
             wsgm_outputs = self._forward_convnext(x)
 
-        # Aggregation
-        if self.aggregation == "average":
-            feat = torch.stack(wsgm_outputs, dim=0).mean(dim=0)
-        else:  # concat
-            feat = torch.cat(wsgm_outputs, dim=-1)
-            feat = self.concat_proj(feat)
-
-        feat = self.ln_post(feat)
+        feat = self._aggregate(wsgm_outputs)
         return self.classifier(feat)
+
+    def forward_with_embedding(self, x: torch.Tensor) -> tuple:
+        """Forward pass returning both logits and pre-classifier embedding.
+
+        Returns:
+            ``(logits, embedding)`` where embedding has shape ``(B, final_dim)``.
+        """
+        if self.arch_type == "vit":
+            wsgm_outputs = self._forward_vit(x)
+        else:
+            wsgm_outputs = self._forward_convnext(x)
+
+        embedding = self._aggregate(wsgm_outputs)
+        logits = self.classifier(embedding)
+        return logits, embedding
 
     # ------------------------------------------------------------------
     # Compatibility helpers

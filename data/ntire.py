@@ -56,7 +56,7 @@ class NTIREDataset(BaseGenAIDataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[Any, int, Dict[str, Any]]:
+    def _load_image_and_label(self, index: int) -> Tuple[Image, int, Dict[str, Any]]:
         if index < 0:
             index += len(self.samples)
         if index < 0 or index >= len(self.samples):
@@ -69,6 +69,10 @@ class NTIREDataset(BaseGenAIDataset):
             "source_id": os.path.basename(image_path),
         }
 
+        return image, label, metadata
+
+    def __getitem__(self, index: int) -> Tuple[Any, int, Dict[str, Any]]:
+        image, label, metadata = self._load_image_and_label(index)
         image = self._apply_transform(image)
         return image, label, metadata
 

@@ -275,21 +275,53 @@ def train_one_epoch(
     epoch: int,
     args,
 ) -> dict:
-    """Train for one epoch. Returns dict with 'loss' and 'accuracy'."""
+    """Train for one epoch. Returns dict with 'loss' and 'accuracy'.
+
+    When ``args.multi_view`` is True, the loader yields 4-tuples
+    ``(view1, view2, labels, metadata)`` and sub-loss components
+    (``loss_ce``, ``loss_supcon``, ``loss_mvc``) are included in
+    the returned dict.
+    """
     model.train()
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
+    use_multi_view = getattr(args, "multi_view", False)
+    sub_loss_meters = {}
+    if use_multi_view:
+        sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
+
     pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False,
                 disable=not is_main_process(args))
-    for images, labels, _metadata in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        batch_size = images.size(0)
+    for batch in pbar:
+        if use_multi_view:
+            views1, views2, labels, _metadata = batch
+            views1 = views1.to(device, non_blocking=True)
+            views2 = views2.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            batch_size = views1.size(0)
 
-        with autocast(device_type="cuda", enabled=args.amp):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            with autocast(device_type="cuda", enabled=args.amp):
+                logits1, _, proj1 = model(views1, return_embedding=True)
+                logits2, _, proj2 = model(views2, return_embedding=True)
+                loss, loss_components = criterion(
+                    logits1, logits2, proj1, proj2, labels,
+                )
+
+            preds = logits1.argmax(dim=1)
+            for k, v in loss_components.items():
+                sub_loss_meters[k].update(v, batch_size)
+        else:
+            images, labels, _metadata = batch
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            batch_size = images.size(0)
+
+            with autocast(device_type="cuda", enabled=args.amp):
+                logits = model(images)
+                loss = criterion(logits, labels)
+
+            preds = logits.argmax(dim=1)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -302,7 +334,6 @@ def train_one_epoch(
         scaler.update()
         scheduler.step()
 
-        preds = logits.argmax(dim=1)
         correct = (preds == labels).sum().item()
         loss_meter.update(loss.item(), batch_size)
         acc_meter.update(correct / batch_size, batch_size)
@@ -313,7 +344,11 @@ def train_one_epoch(
             lr=f"{optimizer.param_groups[0]['lr']:.2e}",
         )
 
-    return {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
+    result = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
+    if use_multi_view:
+        for k, meter in sub_loss_meters.items():
+            result[f"loss_{k}"] = meter.avg
+    return result
 
 
 def validate(
@@ -508,6 +543,13 @@ def main():
         args.freeze_backbone = True
         print_rank0("  WSGM enabled: auto-freezing backbone", args)
 
+    # Auto-enable projection head when multi_view is on
+    if getattr(args, "multi_view", False):
+        if getattr(args, "projection_dim", 0) == 0:
+            args.projection_dim = 128
+        print_rank0("  Multi-view enabled: projection_dim="
+                    f"{args.projection_dim}", args)
+
     # Model
     print_rank0("Building model...", args)
     model = build_model(args).to(device)
@@ -551,7 +593,23 @@ def main():
         print_rank0(f"  LR scaled: {original_lr} -> {args.lr} (x{args._world_size})", args)
 
     # Loss, optimizer, scheduler, scaler
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    val_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    if getattr(args, "multi_view", False):
+        from losses import MultiViewCriterion
+
+        criterion = MultiViewCriterion(
+            lambda_con=args.lambda_con,
+            lambda_mvc=args.lambda_mvc,
+            temperature=args.con_temperature,
+            label_smoothing=args.label_smoothing,
+        )
+        print_rank0(
+            f"  Multi-view criterion: lambda_con={args.lambda_con}, "
+            f"lambda_mvc={args.lambda_mvc}, temperature={args.con_temperature}",
+            args,
+        )
+    else:
+        criterion = val_criterion
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, steps_per_epoch)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -632,11 +690,15 @@ def main():
             writer.add_scalar("train/loss", train_metrics["loss"], epoch)
             writer.add_scalar("train/accuracy", train_metrics["accuracy"], epoch)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+            # Multi-view sub-loss components
+            for key in ("loss_ce", "loss_supcon", "loss_mvc"):
+                if key in train_metrics:
+                    writer.add_scalar(f"train/{key}", train_metrics[key], epoch)
 
         # Validate
         val_metrics = None
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
-            val_metrics = validate(model, val_loader, criterion, device, epoch, args)
+            val_metrics = validate(model, val_loader, val_criterion, device, epoch, args)
 
             if writer is not None:
                 writer.add_scalar("val/loss", val_metrics["loss"], epoch)

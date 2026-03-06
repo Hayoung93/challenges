@@ -120,7 +120,7 @@ class DragonArrowDataset(BaseGenAIDataset):
     def __len__(self) -> int:
         return self._total_rows
 
-    def __getitem__(self, index: int) -> Tuple[Any, int, Dict[str, Any]]:
+    def _load_image_and_label(self, index: int) -> Tuple[Image.Image, int, Dict[str, Any]]:
         if index < 0:
             index += self._total_rows
         if index < 0 or index >= self._total_rows:
@@ -142,5 +142,9 @@ class DragonArrowDataset(BaseGenAIDataset):
             "prompt_cls": table.column("prompt.cls")[local_idx].as_py(),
         }
 
+        return image, label, metadata
+
+    def __getitem__(self, index: int) -> Tuple[Any, int, Dict[str, Any]]:
+        image, label, metadata = self._load_image_and_label(index)
         image = self._apply_transform(image)
         return image, label, metadata

@@ -86,6 +86,13 @@ DEFAULTS = {
     "label_smoothing": 0.1,
     "resume": "",
 
+    # Multi-view consistency training
+    "multi_view": False,
+    "lambda_con": 0.1,        # Supervised contrastive loss weight
+    "lambda_mvc": 0.05,       # Multi-view consistency loss weight
+    "con_temperature": 0.07,  # SupCon temperature
+    "projection_dim": 0,      # Contrastive projection head dimension (0=disabled, auto-set when multi_view)
+
     # Test / inference
     "output_dir": "./predictions",
     "tta": "none",
@@ -263,6 +270,25 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Label smoothing factor for CrossEntropyLoss")
     g.add_argument("--resume", type=str, default=DEFAULTS["resume"],
                     help="Path to checkpoint to resume training from")
+    # Multi-view consistency
+    g.add_argument("--multi_view", action="store_true",
+                    default=DEFAULTS["multi_view"],
+                    help="Enable multi-view consistency training with "
+                         "supervised contrastive loss")
+    g.add_argument("--no_multi_view", dest="multi_view",
+                    action="store_false")
+    g.add_argument("--lambda_con", type=float,
+                    default=DEFAULTS["lambda_con"],
+                    help="Weight for supervised contrastive loss")
+    g.add_argument("--lambda_mvc", type=float,
+                    default=DEFAULTS["lambda_mvc"],
+                    help="Weight for multi-view consistency loss")
+    g.add_argument("--con_temperature", type=float,
+                    default=DEFAULTS["con_temperature"],
+                    help="Temperature for supervised contrastive loss")
+    g.add_argument("--projection_dim", type=int,
+                    default=DEFAULTS["projection_dim"],
+                    help="Projection head output dimension for contrastive loss")
     return parser
 
 

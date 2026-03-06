@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 
-from .base import BaseGenAIDataset
+from .base import BaseGenAIDataset, MultiViewDataset
 from .dragon import DragonArrowDataset
 from .ntire import NTIREDataset, NTIRETestDataset
 from .transforms import get_train_transform, get_tta_prep_transform, get_val_transform
@@ -101,6 +101,15 @@ def _collate_fn(batch):
     return images, labels, list(metadata)
 
 
+def _multi_view_collate_fn(batch):
+    """Collate 4-tuples ``(view1, view2, label, metadata)`` into batched tensors."""
+    views1, views2, labels, metadata = zip(*batch)
+    views1 = torch.stack(views1, dim=0)
+    views2 = torch.stack(views2, dim=0)
+    labels = torch.tensor(labels, dtype=torch.long)
+    return views1, views2, labels, list(metadata)
+
+
 def _tta_collate_fn(batch):
     """Collate 3-tuples with spatial padding for variable-size TTA tensors.
 
@@ -143,8 +152,15 @@ def _make_loader_kwargs(args, is_train: bool) -> dict:
         import torch.distributed as dist
         batch_size = batch_size // dist.get_world_size()
 
+    use_multi_view = is_train and getattr(args, "multi_view", False)
     use_tta_collate = not is_train and _is_tta_prep_active(args)
-    collate = _tta_collate_fn if use_tta_collate else _collate_fn
+
+    if use_multi_view:
+        collate = _multi_view_collate_fn
+    elif use_tta_collate:
+        collate = _tta_collate_fn
+    else:
+        collate = _collate_fn
 
     # Force batch_size=1 for TTA inference to prevent _tta_collate_fn's
     # replicate padding from corrupting center crop positions when images
@@ -262,6 +278,25 @@ def build_train_val_loaders(
         )
         val_transform_datasets[name] = build_dataset(name, args, split="val")
         print(f"  [full] {name}: {len(train_transform_datasets[name]):,} samples")
+
+    # Wrap train datasets for multi-view consistency training
+    use_multi_view = getattr(args, "multi_view", False)
+    if use_multi_view:
+        transform2 = get_train_transform(
+            image_size=getattr(args, "image_size", 224),
+            augmentation=augmentation,
+            total_epochs=getattr(args, "epochs", 30),
+            epoch_state=epoch_state,
+            curriculum_ratio=getattr(args, "curriculum_ratio", 0.5),
+            curriculum_n_min=getattr(args, "curriculum_n_min", 2),
+            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
+            curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
+        )
+        for name in dataset_names:
+            train_transform_datasets[name] = MultiViewDataset(
+                train_transform_datasets[name], transform2,
+            )
+        print("  [multi_view] Enabled: two independent views per sample")
 
     if dataset_mode == "concat":
         combined_train = ConcatDataset(list(train_transform_datasets.values()))
