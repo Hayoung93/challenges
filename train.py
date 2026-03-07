@@ -428,6 +428,13 @@ def train_one_epoch(
     if use_multi_view:
         sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
 
+    # Iteration-level multi-scale setup
+    ms_interval = getattr(args, "multiscale_interval", 0)
+    use_iter_ms = getattr(args, "multiscale", False) and ms_interval > 0
+    ms_sizes = getattr(args, "multiscale_sizes", [])
+    ms_base_size = getattr(args, "_multiscale_train_size", args.image_size)
+    current_ms_size = ms_base_size  # start at max (no downscale on first batch)
+
     # Image logging schedule: compute which batch indices to log at
     _img_log_steps: set[int] = set()
     if writer is not None and getattr(args, "tb_log_images", True):
@@ -440,12 +447,27 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False,
                 disable=not is_main_process(args))
     for batch_idx, batch in enumerate(pbar):
+        # Iteration-level multi-scale: change resolution every N iterations
+        if use_iter_ms and batch_idx % ms_interval == 0:
+            current_ms_size = random.choice(ms_sizes)
+            from models.classifier import update_mambavision_window_size
+            update_mambavision_window_size(model, current_ms_size)
+
         if use_multi_view:
             views1, views2, labels, _metadata = batch
             views1 = views1.to(device, non_blocking=True)
             views2 = views2.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             batch_size = views1.size(0)
+
+            # GPU-side nearest downscale for multi-scale
+            if use_iter_ms and current_ms_size != ms_base_size:
+                views1 = nn.functional.interpolate(
+                    views1, size=current_ms_size, mode="nearest",
+                )
+                views2 = nn.functional.interpolate(
+                    views2, size=current_ms_size, mode="nearest",
+                )
 
             # Log augmented/clean pairs to TensorBoard
             if batch_idx in _img_log_steps:
@@ -470,6 +492,12 @@ def train_one_epoch(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             batch_size = images.size(0)
+
+            # GPU-side nearest downscale for multi-scale
+            if use_iter_ms and current_ms_size != ms_base_size:
+                images = nn.functional.interpolate(
+                    images, size=current_ms_size, mode="nearest",
+                )
 
             # Log augmented images to TensorBoard
             if batch_idx in _img_log_steps:
@@ -500,11 +528,14 @@ def train_one_epoch(
         loss_meter.update(loss.item(), batch_size)
         acc_meter.update(correct / batch_size, batch_size)
 
-        pbar.set_postfix(
+        postfix = dict(
             loss=f"{loss_meter.avg:.4f}",
             acc=f"{acc_meter.avg:.4f}",
             lr=f"{optimizer.param_groups[0]['lr']:.2e}",
         )
+        if use_iter_ms:
+            postfix["res"] = current_ms_size
+        pbar.set_postfix(postfix)
 
     result = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
     if use_multi_view:
@@ -829,6 +860,20 @@ def main():
     print_rank0(f"\nStarting training for {args.epochs} epochs...", args)
     print_rank0(f"  Checkpoints: {args.save_dir}", args)
     print_rank0(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}", args)
+    if getattr(args, "multiscale", False):
+        ms_interval = getattr(args, "multiscale_interval", 0)
+        if ms_interval > 0:
+            print_rank0(
+                f"  Multi-scale: iteration-level (every {ms_interval} iters), "
+                f"sizes={args.multiscale_sizes}, base={getattr(args, '_multiscale_train_size', args.image_size)}, "
+                f"downscale=nearest",
+                args,
+            )
+        else:
+            print_rank0(
+                f"  Multi-scale: epoch-level (round-robin), sizes={args.multiscale_sizes}",
+                args,
+            )
 
     # Curricular augmentation epoch state (None when not using genai_curriculum)
     _epoch_state = getattr(train_loader, "_epoch_state", None)
@@ -842,7 +887,9 @@ def main():
         if _epoch_state is not None:
             _epoch_state.value = epoch
 
-        # Multi-scale: sample resolution for this epoch
+        # Multi-scale: per-epoch resolution change (legacy, multiscale_interval=0)
+        # When multiscale_interval > 0, resolution is changed per-iteration
+        # inside train_one_epoch via GPU-side F.interpolate(nearest).
         if _scale_state is not None:
             scales = args.multiscale_sizes
             current_scale = scales[epoch % len(scales)]
@@ -882,15 +929,18 @@ def main():
 
         # Validate
         val_metrics = None
+        _use_iter_ms = getattr(args, "multiscale", False) and getattr(args, "multiscale_interval", 0) > 0
+        _need_window_restore = _scale_state is not None or _use_iter_ms
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
             # MambaVision: restore default resolution window_size for validation
-            if _scale_state is not None:
+            if _need_window_restore:
                 from models.classifier import update_mambavision_window_size
                 update_mambavision_window_size(model, args.image_size)
 
             val_metrics = validate(model, val_loader, val_criterion, device, epoch, args)
 
-            # MambaVision: re-apply current scale for next training epoch
+            # MambaVision: re-apply scale for next training epoch
+            # (per-epoch mode only; iteration-level resets at next batch)
             if _scale_state is not None:
                 update_mambavision_window_size(model, _scale_state.value)
 

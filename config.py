@@ -37,6 +37,7 @@ DEFAULTS = {
     # Multi-scale training
     "multiscale": False,
     "multiscale_sizes": [224, 256, 288, 320, 384, 448, 512],
+    "multiscale_interval": 100,  # change resolution every N iterations (0 = per-epoch)
 
     # Dragon-specific
     "dragon_lru_capacity": 4,
@@ -174,6 +175,10 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["multiscale_sizes"],
                     help="Pool of input resolutions for multi-scale training "
                          "(all must be divisible by 32)")
+    g.add_argument("--multiscale_interval", type=int,
+                    default=DEFAULTS["multiscale_interval"],
+                    help="Change resolution every N iterations "
+                         "(0 = per-epoch round-robin)")
     g.add_argument("--dragon_lru_capacity", type=int, default=DEFAULTS["dragon_lru_capacity"])
     g.add_argument("--dragon_index_cache", type=str, default=DEFAULTS["dragon_index_cache"])
     g.add_argument("--seed", type=int, default=DEFAULTS["seed"])

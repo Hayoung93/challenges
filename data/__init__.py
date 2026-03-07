@@ -45,7 +45,8 @@ def _is_tta_prep_active(args) -> bool:
 
 
 def build_dataset(name: str, args, split: str = "train",
-                  epoch_state=None, scale_state=None) -> BaseGenAIDataset:
+                  epoch_state=None, scale_state=None,
+                  image_size_override: int | None = None) -> BaseGenAIDataset:
     """Build a single dataset by name.
 
     Args:
@@ -54,10 +55,14 @@ def build_dataset(name: str, args, split: str = "train",
         split: ``"train"`` or ``"val"``.
         epoch_state: ``multiprocessing.Value`` for curricular augmentation.
         scale_state: ``multiprocessing.Value`` for multi-scale training.
+        image_size_override: Override the image size for transforms.
+            Used by iteration-level multiscale to always produce max
+            resolution images from the DataLoader.
     """
     if split == "train":
+        effective_size = image_size_override or getattr(args, "image_size", 224)
         transform = get_train_transform(
-            image_size=getattr(args, "image_size", 224),
+            image_size=effective_size,
             augmentation=getattr(args, "augmentation", "default"),
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
@@ -274,9 +279,25 @@ def build_train_val_loaders(
         epoch_state = multiprocessing.Value("i", 0)
 
     # Create shared scale counter for multi-scale training
+    # When multiscale_interval > 0, resolution is changed in the training
+    # loop via GPU-side F.interpolate (nearest), so the DataLoader always
+    # produces images at max resolution and scale_state is not shared with
+    # workers.  When multiscale_interval == 0, the legacy per-epoch
+    # scale_state approach is used.
     scale_state = None
-    if getattr(args, "multiscale", False):
+    multiscale_interval = getattr(args, "multiscale_interval", 100)
+    use_iter_multiscale = (
+        getattr(args, "multiscale", False) and multiscale_interval > 0
+    )
+    if getattr(args, "multiscale", False) and not use_iter_multiscale:
         scale_state = multiprocessing.Value("i", getattr(args, "image_size", 224))
+
+    # For iteration-level multiscale, override image_size to max resolution
+    # so the DataLoader always outputs the largest size.
+    train_image_size = getattr(args, "image_size", 224)
+    if use_iter_multiscale:
+        train_image_size = max(args.multiscale_sizes)
+        args._multiscale_train_size = train_image_size
 
     # Build datasets with both train and val transforms
     train_transform_datasets: Dict[str, BaseGenAIDataset] = {}
@@ -285,6 +306,7 @@ def build_train_val_loaders(
         train_transform_datasets[name] = build_dataset(
             name, args, split="train",
             epoch_state=epoch_state, scale_state=scale_state,
+            image_size_override=train_image_size if use_iter_multiscale else None,
         )
         val_transform_datasets[name] = build_dataset(name, args, split="val")
         print(f"  [full] {name}: {len(train_transform_datasets[name]):,} samples")
@@ -293,7 +315,7 @@ def build_train_val_loaders(
     use_multi_view = getattr(args, "multi_view", False)
     if use_multi_view:
         transform2 = get_train_transform(
-            image_size=getattr(args, "image_size", 224),
+            image_size=train_image_size,
             augmentation=augmentation,
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
