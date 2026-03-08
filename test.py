@@ -181,7 +181,6 @@ _WARN_KEYS = [
     ("wsgm_dropout",          "WSGM dropout"),
     ("wsgm_aggregation",      "WSGM aggregation"),
     ("drop_rate",             "Dropout rate"),
-    ("projection_dim",        "Projection dim"),
 ]
 
 
