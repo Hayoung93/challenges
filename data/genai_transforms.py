@@ -1202,6 +1202,115 @@ class RandomBlockDistortion:
         )
 
 
+class RandomDCTBasisOverlay:
+    """Overlay JPEG-like DCT basis patterns onto 8x8 image blocks.
+
+    Simulates the characteristic DCT basis ringing artifacts observed in
+    test-set images that have undergone heavy JPEG compression.  Unlike
+    :class:`RandomBlockDistortion` (which uses synthetic solid/stripe/noise
+    fills), this transform adds **actual DCT-II basis functions** to a
+    random subset of 8×8 blocks, producing visually authentic blocking
+    artifacts with the correct frequency structure.
+
+    Each affected block receives 1–``n_basis_max`` randomly chosen non-DC
+    basis functions (from the 63 possible AC components), each scaled by
+    a random coefficient drawn from ``[-strength, +strength]``.
+
+    The 63 basis tiles are precomputed at ``__init__`` time via
+    ``scipy.fft.idctn`` for efficiency.
+
+    This transform supports the ``_intensity`` protocol used by
+    :class:`CurricularGroupedNOfCompose` for curriculum scheduling.
+
+    Args:
+        strength_range: ``(min, max)`` peak additive amplitude per basis.
+        n_basis_range: ``(min, max)`` number of basis functions overlaid
+            per affected block.
+        block_coverage: Fraction of 8×8 blocks that receive the overlay.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(
+        self,
+        strength_range=(5.0, 40.0),
+        n_basis_range=(1, 3),
+        block_coverage=0.3,
+        p=0.05,
+    ):
+        self.strength_range = strength_range
+        self.n_basis_range = n_basis_range
+        self.block_coverage = block_coverage
+        self.p = p
+        self._intensity = 1.0
+
+        # Precompute all 63 non-DC 8×8 DCT-II basis tiles.
+        from scipy.fft import idctn
+
+        self._basis_tiles = []
+        self._basis_indices = []
+        for u in range(8):
+            for v in range(8):
+                if u == 0 and v == 0:
+                    continue  # skip DC component
+                coeff = np.zeros((8, 8), dtype=np.float64)
+                coeff[u, v] = 1.0
+                tile = idctn(coeff, type=2, norm="ortho").astype(np.float32)
+                self._basis_tiles.append(tile)
+                self._basis_indices.append((u, v))
+        # Stack into (63, 8, 8) array for efficient indexing.
+        self._basis_tiles = np.stack(self._basis_tiles)  # (63, 8, 8)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        w, h = img.size
+        n_bx = w // 8
+        n_by = h // 8
+        if n_bx == 0 or n_by == 0:
+            return img
+
+        arr = np.array(img, dtype=np.float32)
+
+        # Intensity-scaled strength
+        lo, hi = _iscale_upper(self.strength_range, self._intensity)
+        max_strength = random.uniform(lo, hi)
+
+        # Select which blocks to affect
+        total_blocks = n_bx * n_by
+        n_affected = max(1, round(total_blocks * self.block_coverage))
+        n_affected = min(n_affected, total_blocks)
+        affected = random.sample(range(total_blocks), n_affected)
+
+        n_basis_lo, n_basis_hi = self.n_basis_range
+        n_tiles = len(self._basis_tiles)
+
+        for idx in affected:
+            by, bx = divmod(idx, n_bx)
+            y0, x0 = by * 8, bx * 8
+
+            n = random.randint(n_basis_lo, n_basis_hi)
+            chosen = random.sample(range(n_tiles), min(n, n_tiles))
+
+            for ti in chosen:
+                tile = self._basis_tiles[ti]  # (8, 8)
+                s = random.uniform(-max_strength, max_strength)
+                # Add to all channels
+                arr[y0:y0 + 8, x0:x0 + 8, :] += (tile * s)[:, :, np.newaxis]
+
+        np.clip(arr, 0, 255, out=arr)
+        return Image.fromarray(arr.astype(np.uint8))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"strength_range={self.strength_range}, "
+            f"n_basis_range={self.n_basis_range}, "
+            f"block_coverage={self.block_coverage}, "
+            f"p={self.p})"
+        )
+
+
 class RandomMoire:
     """Apply moire-pattern augmentation via sine-wave synthesis or real pattern blending.
 

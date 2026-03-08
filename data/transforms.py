@@ -11,8 +11,8 @@ from .genai_transforms import (
     IntensityGaussianBlur,
     IntensityRandomPerspective,
     SkipIfClean,
-    RandomBlockDistortion,
     RandomBoxBlur,
+    RandomDCTBasisOverlay,
     RandomMoire,
     RandomBrightnessCurve,
     RandomChromaNoise,
@@ -507,7 +507,7 @@ def get_train_transform(
         return T.Compose(
             _robust_geometric(image_size)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
@@ -530,7 +530,7 @@ def get_train_transform(
         return T.Compose(
             _robust_geometric(image_size)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
@@ -561,7 +561,7 @@ def get_train_transform(
         return T.Compose(
             _robust_geometric(image_size, color_jitter=curricular_cj)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.08))]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.08))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
             + _to_tensor_normalize()
         )
