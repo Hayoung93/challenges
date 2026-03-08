@@ -3,6 +3,7 @@ from typing import Callable
 import torchvision.transforms as T
 
 from .genai_transforms import (
+    CurricularColorJitter,
     CurricularGroupedNOfCompose,
     CurricularNOfCompose,
     CurricularWrapper,
@@ -184,19 +185,31 @@ def _augly_artifact_pool() -> list:
     ]
 
 
-def _robust_geometric(image_size: int, crop_p: float = 0.5) -> list:
+def _robust_geometric(image_size: int, crop_p: float = 0.5,
+                      color_jitter=None) -> list:
     """Geometric + color augmentations for robust pipelines.
 
     Same as :func:`_genai_geometric` but with rotation applied at only
     2.5 % probability instead of 100 %, to avoid destroying pixel-level
     artifacts that robust augmentation is designed to preserve.
+
+    Args:
+        image_size: Target square output size.
+        crop_p: Probability of pixel-preserving crop path.
+        color_jitter: Optional replacement for the default
+            ``T.ColorJitter``.  Pass a :class:`CurricularColorJitter`
+            to make colour perturbation curriculum-aware.
     """
+    if color_jitter is None:
+        color_jitter = T.ColorJitter(
+            brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2,
+        )
     return [
         RandomResizeOrCrop(image_size, crop_p=crop_p, scale=(0.5, 1.0)),
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
         T.RandomApply([T.RandomRotation(degrees=15)], p=0.025),
-        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+        color_jitter,
         T.RandomGrayscale(p=0.1),
         T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
     ]
@@ -241,7 +254,6 @@ def _robust_artifact_groups() -> dict:
             RandomColorQuantization(levels_range=(7, 20), p=1.0),
             RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0),
             RandomPosterize(bits_range=(2, 6), p=1.0),
-            T.RandomGrayscale(p=1.0),
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
@@ -291,9 +303,8 @@ def _robust_artifact_groups_extended() -> dict:
         ],
         "color": [
             RandomColorQuantization(levels_range=(7, 20), p=1.0),
-            RandomGammaCorrection(gamma_range=(0.3, 3.0), p=1.0),
+            RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0),
             RandomPosterize(bits_range=(2, 6), p=1.0),
-            T.RandomGrayscale(p=1.0),
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
@@ -521,6 +532,13 @@ def get_train_transform(
         if epoch_state is None:
             import multiprocessing
             epoch_state = multiprocessing.Value("i", 0)
+        curricular_cj = CurricularColorJitter(
+            brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1,
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            curriculum_ratio=curriculum_ratio,
+            min_scale=0.2,
+        )
         artifact_compose = CurricularGroupedNOfCompose(
             _robust_artifact_groups_extended(),
             epoch_state=epoch_state,
@@ -535,7 +553,7 @@ def get_train_transform(
             intensity_curriculum=True,
         )
         return T.Compose(
-            _robust_geometric(image_size)
+            _robust_geometric(image_size, color_jitter=curricular_cj)
             + [artifact_compose]
             + [SkipIfClean(artifact_compose, RandomBlockDistortion(p=0.08))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]

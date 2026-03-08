@@ -1753,6 +1753,78 @@ class IntensityRandomPerspective:
                 f"distortion_scale={self.distortion_scale}, p={self.p})")
 
 
+class CurricularColorJitter:
+    """Curriculum-aware ColorJitter that scales parameters by training progress.
+
+    At epoch 0 the jitter parameters are scaled by ``min_scale`` (gentle
+    colour perturbation).  At ``total_epochs * curriculum_ratio`` they
+    reach their full configured values, preventing aggressive colour
+    distortion early in training when the model is still learning basic
+    features.
+
+    Unlike ``IntensityGaussianBlur`` which relies on an externally set
+    ``_intensity`` attribute, this class reads ``epoch_state`` directly
+    and computes its own scale — matching the self-contained design of
+    :class:`CurricularWrapper`.
+
+    Args:
+        brightness: Maximum brightness jitter (same semantics as
+            ``torchvision.transforms.ColorJitter``).
+        contrast: Maximum contrast jitter.
+        saturation: Maximum saturation jitter.
+        hue: Maximum hue jitter.
+        epoch_state: ``multiprocessing.Value('i', 0)`` shared with the
+            training loop.
+        total_epochs: Total number of training epochs.
+        curriculum_ratio: Fraction of total epochs over which the
+            curriculum ramps from ``min_scale`` to 1.0.
+        min_scale: Scale factor at epoch 0.  Default ``0.2`` gives
+            gentle jitter (e.g. brightness ±8 %, hue ±3.6° when the
+            full parameters are brightness=0.4, hue=0.1).
+    """
+
+    def __init__(self, brightness=0.4, contrast=0.4, saturation=0.3,
+                 hue=0.1, epoch_state=None, total_epochs=30,
+                 curriculum_ratio=0.5, min_scale=0.2):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        self.epoch_state = epoch_state
+        self.total_epochs = total_epochs
+        self.curriculum_ratio = curriculum_ratio
+        self.min_scale = min_scale
+
+    def _get_scale(self):
+        if self.epoch_state is None or self.total_epochs <= 1:
+            return 1.0
+        curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        if curriculum_epochs <= 1:
+            return 1.0
+        progress = self.epoch_state.value / (curriculum_epochs - 1)
+        progress = min(max(progress, 0.0), 1.0)
+        return self.min_scale + (1.0 - self.min_scale) * progress
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        s = self._get_scale()
+        jitter = T.ColorJitter(
+            brightness=self.brightness * s,
+            contrast=self.contrast * s,
+            saturation=self.saturation * s,
+            hue=self.hue * s,
+        )
+        return jitter(img)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"brightness={self.brightness}, contrast={self.contrast}, "
+            f"saturation={self.saturation}, hue={self.hue}, "
+            f"min_scale={self.min_scale}, "
+            f"curriculum_ratio={self.curriculum_ratio})"
+        )
+
+
 class SkipIfClean:
     """Skip *transform* when the upstream compose triggered clean pass-through.
 
