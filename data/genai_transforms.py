@@ -345,6 +345,8 @@ class CurricularWrapper:
         if self.total_epochs <= 1:
             return 1.0
         curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        if curriculum_epochs <= 1:
+            return 1.0
         progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
         return self.min_scale + (1.0 - self.min_scale) * progress

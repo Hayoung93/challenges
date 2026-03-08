@@ -435,6 +435,13 @@ def train_one_epoch(
     ms_base_size = getattr(args, "_multiscale_train_size", args.image_size)
     current_ms_size = ms_base_size  # start at max (no downscale on first batch)
 
+    # Same-label CutMix setup
+    _ROBUST_AUGS = {"robust", "robust_curriculum", "robust_curriculum_range"}
+    _cutmix_active = (
+        getattr(args, "cutmix_p", 0.0) > 0.0
+        and getattr(args, "augmentation", "default") in _ROBUST_AUGS
+    )
+
     # Image logging schedule: compute which batch indices to log at
     _img_log_steps: set[int] = set()
     if writer is not None and getattr(args, "tb_log_images", True):
@@ -469,6 +476,14 @@ def train_one_epoch(
                     views2, size=current_ms_size, mode="nearest",
                 )
 
+            # Same-label CutMix (multi-view)
+            if _cutmix_active:
+                from data.cutmix import same_label_cutmix_multi_view
+                views1, views2 = same_label_cutmix_multi_view(
+                    views1, views2, labels,
+                    p=args.cutmix_p, alpha=args.cutmix_alpha,
+                )
+
             # Log augmented/clean pairs to TensorBoard
             if batch_idx in _img_log_steps:
                 global_step = epoch * len(loader) + batch_idx
@@ -497,6 +512,14 @@ def train_one_epoch(
             if use_iter_ms and current_ms_size != ms_base_size:
                 images = nn.functional.interpolate(
                     images, size=current_ms_size, mode="nearest",
+                )
+
+            # Same-label CutMix (single-view)
+            if _cutmix_active:
+                from data.cutmix import same_label_cutmix
+                images = same_label_cutmix(
+                    images, labels,
+                    p=args.cutmix_p, alpha=args.cutmix_alpha,
                 )
 
             # Log augmented images to TensorBoard

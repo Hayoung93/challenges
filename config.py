@@ -91,6 +91,10 @@ DEFAULTS = {
     "label_smoothing": 0.1,
     "resume": "",
 
+    # Same-label CutMix (robust augmentation only)
+    "cutmix_p": 0.0,       # 0.0 = disabled by default
+    "cutmix_alpha": 0.4,   # Beta distribution alpha
+
     # TensorBoard image logging
     "tb_log_images": True,
     "tb_log_images_per_epoch": 5,  # how many times per epoch to log input images
@@ -293,6 +297,13 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Label smoothing factor for CrossEntropyLoss")
     g.add_argument("--resume", type=str, default=DEFAULTS["resume"],
                     help="Path to checkpoint to resume training from")
+    # Same-label CutMix
+    g.add_argument("--cutmix_p", type=float, default=DEFAULTS["cutmix_p"],
+                    help="Probability of applying same-label CutMix per batch "
+                         "(only active for robust augmentation modes, 0=disabled)")
+    g.add_argument("--cutmix_alpha", type=float, default=DEFAULTS["cutmix_alpha"],
+                    help="Beta distribution alpha for CutMix lambda sampling "
+                         "(smaller = smaller cuts on average)")
     # TensorBoard image logging
     g.add_argument("--tb_log_images", action="store_true",
                     default=DEFAULTS["tb_log_images"],

@@ -189,9 +189,9 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
                       color_jitter=None) -> list:
     """Geometric + color augmentations for robust pipelines.
 
-    Same as :func:`_genai_geometric` but with rotation applied at only
-    2.5 % probability instead of 100 %, to avoid destroying pixel-level
-    artifacts that robust augmentation is designed to preserve.
+    Same as :func:`_genai_geometric` but with rotation removed entirely
+    to avoid destroying pixel-level artifacts that robust augmentation
+    is designed to preserve.
 
     Args:
         image_size: Target square output size.
@@ -208,7 +208,6 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
         RandomResizeOrCrop(image_size, crop_p=crop_p, scale=(0.5, 1.0)),
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
-        T.RandomApply([T.RandomRotation(degrees=15)], p=0.025),
         color_jitter,
         T.RandomGrayscale(p=0.1),
         T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
