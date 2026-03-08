@@ -45,6 +45,9 @@ python test.py --checkpoint_path ./checkpoints/best.pth --eval_val --val_dataset
 
 # 배치 크기, worker 수 조정
 python test.py --checkpoint_path ./checkpoints/best.pth --batch_size 64 --num_workers 4
+
+# Softmax score CSV 출력
+python test.py --checkpoint_path ./checkpoints/best.pth --output_scores
 ```
 
 ## Test Mode
@@ -91,6 +94,18 @@ test_0002.jpg,0
 | `image_name` | `str` | 이미지 파일명 (metadata의 `source_id`) |
 | `label` | `int` | 예측 라벨. `0` = real, `1` = fake |
 
+### Score CSV (`--output_scores`)
+
+`--output_scores` 사용 시 softmax 확률이 포함된 별도 CSV도 생성된다.
+
+```csv
+image_name,score
+test_0000.jpg,0.1234
+test_0001.jpg,0.9876
+```
+
+`score`는 fake 클래스(class 1)의 softmax 확률이다.
+
 ## TTA (Test-Time Augmentation)
 
 `--tta` 옵션으로 다양한 TTA 전략을 선택할 수 있다. 각 augmented view에 대한 logit을 평균하여 최종 예측을 수행한다.
@@ -100,54 +115,49 @@ logits_final = mean(logits_view_1, logits_view_2, ..., logits_view_N)
 prediction = argmax(logits_final)
 ```
 
-### TTA 모드 (Legacy: `tta_prep_size` 미지정 또는 `== image_size`)
+### TTA 모드
 
-| 모드 | Views | Forward passes | 구성 |
-|------|-------|---------------|------|
-| `none` | 1 | 1x | 원본만 (TTA 없음) |
-| `flip` | 2 | 2x | 원본 + horizontal flip |
-| `multiscale` | 4 | 4x | 원본 + 3 multi-scale crops (256, 288, 320 → CenterCrop 224) |
-| `full` | 8 | 8x | 원본 + flip + 3 rotations (90°/180°/270°) + 3 multi-scale crops |
+| 모드 | 설명 | Views |
+|------|------|-------|
+| `none` | TTA 없음 (원본만) | 1 |
+| `flip` | 원본 + horizontal flip | 2 |
+| `multiscale` | 원본 + 3 multi-scale crops | 4 |
+| `full` | Pixel-preserving: center + flip + 4 corner crops + 3 multi-scale | 9 |
+| `full_legacy` | Rotation 기반: 원본 + flip + 3 rotations + 3 multi-scale | 8 |
 
-### Pixel-Preserving TTA (`--tta_prep_size 512`)
+### Pixel-Preserving TTA (`full` 모드)
 
-`--tta_prep_size`를 `image_size`보다 크게 설정하면 pixel-preserving TTA가 활성화된다. 이미지를 큰 prep tensor로 로드한 뒤, resize 없이 직접 crop하는 뷰(pixel 보존)와 resize 기반 뷰를 함께 생성한다. GenAI 아티팩트 검출에 적합하다.
+`full` 모드는 prep tensor(기본 512)에서 resize 없이 직접 crop하여 원본 pixel을 보존한다. GenAI 아티팩트 검출에 적합하다.
 
-| 모드 | Crop-only 뷰 | Resize 뷰 | 총 Views | Crop:Resize 비율 |
-|------|-------------|-----------|----------|-----------------|
-| `none` | center crop (1) | - | 1 | 1:0 |
-| `flip` | center + flip (2) | - | 2 | 2:0 |
-| `multiscale` | center (1) | 3 scales (3) | 4 | 1:3 |
-| `full` | center + flip + 4 corners (6) | 3 scales (3) | 9 | **2:1** |
+| 뷰 유형 | 구성 | 비고 |
+|----------|------|------|
+| Crop-only | center + flip + 4 corners (6) | Interpolation 없이 원본 pixel 보존 |
+| Resize | 3 scales (3) | 원본 해상도에서 출발하여 resize 후 center crop |
 
-- **Crop-only 뷰**: prep tensor에서 직접 crop (tensor slicing). Interpolation 없이 원본 pixel 그대로 보존.
-- **Resize 뷰**: prep tensor를 resize 후 center crop. 기존 multi-scale과 동일하지만 원본 해상도에서 출발.
-- `ResizeIfSmaller`: 이미지의 shortest edge가 `prep_size` 이상이면 resize를 하지 않음 → 대부분의 GenAI 이미지(512+)에서 interpolation 0회.
+- `--tta_min_prep_size`: prep tensor 최소 크기 (기본 512). 이 크기 이상 이미지는 원본 해상도 유지
+- `full_legacy`: 기존 rotation 기반 TTA가 필요한 경우 사용
 
 ### 사용법
 
 ```bash
-# Legacy TTA (기존 동작)
-python test.py --checkpoint_path ./checkpoints/best.pth --tta flip
+# Pixel-preserving TTA (권장)
 python test.py --checkpoint_path ./checkpoints/best.pth --tta full
 
-# Pixel-preserving TTA (권장)
-python test.py --checkpoint_path ./checkpoints/best.pth --tta full --tta_prep_size 512
+# Flip만
+python test.py --checkpoint_path ./checkpoints/best.pth --tta flip
+
+# 기존 rotation 기반 TTA
+python test.py --checkpoint_path ./checkpoints/best.pth --tta full_legacy
+
+# prep tensor 크기 조정
+python test.py --checkpoint_path ./checkpoints/best.pth --tta full --tta_min_prep_size 768
 
 # 메모리 부족 시 batch_size 조정
-python test.py --checkpoint_path ./checkpoints/best.pth --tta full --tta_prep_size 512 --batch_size 16
+python test.py --checkpoint_path ./checkpoints/best.pth --tta full --batch_size 16
 
 # TTA 없이 추론
-python test.py --checkpoint_path ./checkpoints/best.pth --tta none
 python test.py --checkpoint_path ./checkpoints/best.pth   # 기본값 = none
 ```
-
-### 설계 원리
-
-- **Pixel-preserving crop**: prep tensor에서 center crop, 4 corner crop을 tensor slicing으로 수행. Interpolation이 없으므로 GenAI 생성 아티팩트가 완전히 보존됨.
-- **Multi-scale crop**: normalized tensor에 `F.interpolate` (bilinear) → `center_crop(224)`. Normalization은 per-channel affine transform이므로 interpolation 후 normalize와 수학적으로 동치.
-- **Legacy 호환**: `tta_prep_size` 미지정 시(기본값 224) rotation 기반 legacy 경로가 그대로 사용됨.
-- **메모리 효율**: view별 순차 forward로 batch를 N배로 concat하지 않음. `tta_prep_size=512` 사용 시 tensor 크기가 ~5.2x 증가하므로 `batch_size`를 줄여야 할 수 있음.
 
 ## Validation 평가 (--eval_val)
 
@@ -213,6 +223,38 @@ torchrun --nproc_per_node=4 train.py --batch_size 32
 python test.py --checkpoint_path ./checkpoints/best.pth
 ```
 
+## Ensemble 추론
+
+여러 모델의 예측을 결합하여 성능을 높인다.
+
+```bash
+# 2개 모델 앙상블 (mean_prob)
+python test.py \
+    --ensemble_checkpoints ./ckpt/model_a.pth ./ckpt/model_b.pth \
+    --ensemble_models dinov3_vits16plus mamba_vision_T
+
+# 가중 평균 + 모델별 TTA
+python test.py \
+    --ensemble_checkpoints ./ckpt/a.pth ./ckpt/b.pth \
+    --ensemble_models dinov3_vits16plus mamba_vision_T \
+    --ensemble_weights 0.7 0.3 \
+    --ensemble_tta full flip
+
+# Majority vote
+python test.py \
+    --ensemble_checkpoints ./ckpt/a.pth ./ckpt/b.pth ./ckpt/c.pth \
+    --ensemble_models dinov3_vits16plus dinov3_vits16plus mamba_vision_T \
+    --ensemble_method majority_vote
+```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--ensemble_checkpoints` | `[]` | 각 모델의 checkpoint 경로 리스트 |
+| `--ensemble_models` | `[]` | 각 checkpoint에 대응하는 모델명 리스트 |
+| `--ensemble_weights` | `[]` (균등) | 모델별 가중치 (비어있으면 균등 배분) |
+| `--ensemble_method` | `"mean_prob"` | `mean_prob`, `mean_logit`, `majority_vote` |
+| `--ensemble_tta` | `[]` | 모델별 TTA 모드 (비어있으면 `--tta` 값 공통 적용) |
+
 ## Args 레퍼런스
 
 ### Test 전용 옵션
@@ -221,9 +263,10 @@ python test.py --checkpoint_path ./checkpoints/best.pth
 |------|------|--------|------|
 | `checkpoint_path` | `str` | `""` | 모델 checkpoint 경로 **(필수)** |
 | `output_dir` | `str` | `"./predictions"` | CSV 출력 디렉토리 |
-| `tta` | `str` | `"none"` | TTA 모드: `none`, `flip`, `multiscale`, `full` (값 없이 `--tta`만 쓰면 `flip`) |
-| `tta_prep_size` | `int` | `224` | TTA prep tensor 크기. `image_size`보다 크면 pixel-preserving crop 활성화 (권장: `512`) |
+| `tta` | `str` | `"none"` | TTA 모드: `none`, `flip`, `multiscale`, `full`, `full_legacy` |
+| `tta_min_prep_size` | `int` | `512` | Prep tensor 최소 크기. 이 크기 이상 이미지는 원본 해상도 유지 |
 | `eval_val` | `bool` | `False` | Labeled validation 데이터 평가 수행 |
+| `output_scores` | `bool` | `False` | Softmax score CSV 출력 (`image_name,score`) |
 | `amp` | `bool` | `True` | Automatic Mixed Precision |
 | `ntire_test_mode` | `int` | `1` | 테스트 subset: `1`=val_images, `2`=val_images_hard, `3`=둘 다 |
 
@@ -241,4 +284,4 @@ CUDA가 사용 불가능하면 AMP가 자동으로 비활성화되고 CPU에서 
 
 ### 메모리
 
-추론 시 gradient 계산이 없으므로 (`@torch.no_grad()`) 학습 대비 메모리 사용량이 적다. Legacy TTA 사용 시에도 추가 메모리는 거의 없다. `--tta_prep_size 512` 사용 시 batch tensor 크기가 ~5.2x 증가하므로 `--batch_size`를 줄여야 할 수 있다.
+추론 시 `@torch.no_grad()`로 gradient 계산이 없어 메모리 효율적이다. `--tta full` 사용 시 prep tensor 크기 증가로 `--batch_size` 조정이 필요할 수 있다.

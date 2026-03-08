@@ -48,6 +48,16 @@ python train.py --augmentation augly               # AugLy 하이브리드: 11�
 python train.py --augmentation augly_curriculum     # AugLy 하이브리드 + curriculum (epoch별 1→5개 점진 증가)
 python train.py --augmentation robust              # Robust: 6개 그룹(blur,compression,noise,resize,color,spatial)에서 4개 선택·그룹당 1개 적용
 python train.py --augmentation robust_curriculum   # Robust + curriculum (epoch별 2→5개 그룹 점진 증가)
+python train.py --augmentation robust_curriculum_range  # Robust curriculum + n_min~n_max 범위 샘플링
+
+# Curriculum 파라미터 조정
+python train.py --augmentation genai_curriculum --curriculum_ratio 0.5  # 전체 epoch의 50% 시점에 최대 강도 도달
+python train.py --augmentation robust_curriculum_range \
+    --curriculum_n_min 2 --curriculum_n_max_start 3 --curriculum_n_max_end 7
+
+# Same-label CutMix (robust augmentation 전용)
+python train.py --augmentation robust --cutmix_p 0.5                  # 50% 확률로 CutMix 적용
+python train.py --augmentation robust --cutmix_p 0.5 --cutmix_alpha 0.4  # Beta 분포 alpha 조정
 
 # backbone 고정 (head만 학습)
 python train.py --freeze_backbone --lr 1e-3 --epochs 10
@@ -81,6 +91,26 @@ python train.py --image_size 384 --resize_size 384 --model_name mamba_vision_L2_
 ```
 
 224 pretrained 가중치는 384에서 shape 충돌 없이 그대로 로드된다 (position embedding 없음).
+
+## Multi-scale 학습
+
+학습 중 입력 해상도를 동적으로 변경하여 다양한 스케일에서의 robustness를 높인다.
+
+```bash
+# 기본 multi-scale (224~512 사이 7단계, 100 iteration마다 변경)
+python train.py --multiscale
+
+# 커스텀 해상도 풀 + epoch 단위 변경
+python train.py --multiscale --multiscale_sizes 224 384 512 --multiscale_interval 0
+```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--multiscale` | `False` | Multi-scale 학습 활성화 |
+| `--multiscale_sizes` | `[224,256,288,320,384,448,512]` | 해상도 풀 (32의 배수) |
+| `--multiscale_interval` | `100` | 해상도 변경 주기 (iterations). `0` = epoch 단위 |
+
+`image_size`가 풀에 없으면 자동 추가된다.
 
 ## DINOv3 모델 사용
 
@@ -210,6 +240,29 @@ python test.py --model_name dinov3_vits16plus --wsgm \
     --checkpoint_path checkpoints/run/best.pth
 ```
 
+## Multi-view Consistency Training
+
+동일 이미지의 서로 다른 augmentation 뷰 간 일관성을 학습하여 robustness를 높인다. CE loss에 supervised contrastive loss + view consistency loss를 추가한다.
+
+```bash
+# 기본 multi-view
+python train.py --multi_view
+
+# loss 가중치 조정
+python train.py --multi_view --lambda_con 0.1 --lambda_mvc 0.05
+
+# contrastive projection head 차원 지정
+python train.py --multi_view --projection_dim 128
+```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--multi_view` | `False` | Multi-view consistency 학습 활성화 |
+| `--lambda_con` | `0.1` | Supervised contrastive loss 가중치 |
+| `--lambda_mvc` | `0.05` | Multi-view consistency loss 가중치 |
+| `--con_temperature` | `0.07` | SupCon 온도 파라미터 |
+| `--projection_dim` | `0` | Contrastive projection head 차원 (`0` = multi_view 시 자동 설정) |
+
 ## 데이터 분할
 
 `build_train_val_loaders()`는 `--train_datasets`에 지정된 학습 데이터를 `--val_split_ratio` 비율로 train/val로 분할한다. `--seed`를 고정하면 동일한 분할이 재현된다.
@@ -252,40 +305,15 @@ python train.py --scheduler step --step_lr_size 10 --step_lr_decay 0.1
 # warmup 5 epoch 후, 매 10 epoch마다 lr × 0.1
 ```
 
-## Mixed Precision (AMP)
+## AMP / Gradient Clipping / Early Stopping / Label Smoothing
 
-기본적으로 활성화되어 있다. `torch.amp.autocast` + `GradScaler`를 사용하며, CUDA가 없으면 자동으로 비활성화된다.
-
-```bash
-python train.py --amp       # 기본값
-python train.py --no_amp    # 비활성화 (디버깅 등)
-```
-
-## Gradient Clipping
-
-기본값 `1.0`으로 gradient norm clipping이 적용된다. `0`으로 설정하면 비활성화.
+기본 활성화 옵션들. 각 기본값과 비활성화 방법은 아래와 같다:
 
 ```bash
-python train.py --grad_clip_norm 1.0   # 기본값
-python train.py --grad_clip_norm 0     # 비활성화
-```
-
-## Early Stopping
-
-Validation accuracy가 `--early_stopping_patience` epoch 동안 개선되지 않으면 학습을 중단한다. `0`으로 설정하면 비활성화.
-
-```bash
-python train.py --early_stopping_patience 7    # 기본값: 7 epoch
-python train.py --early_stopping_patience 0    # 비활성화
-```
-
-## Label Smoothing
-
-CrossEntropyLoss에 label smoothing을 적용한다.
-
-```bash
-python train.py --label_smoothing 0.1   # 기본값
-python train.py --label_smoothing 0.0   # 비활성화
+python train.py --no_amp                      # AMP 비활성화 (기본: 활성, CUDA 없으면 자동 비활성)
+python train.py --grad_clip_norm 0            # Gradient clipping 비활성화 (기본: 1.0)
+python train.py --early_stopping_patience 0   # Early stopping 비활성화 (기본: 7 epoch)
+python train.py --label_smoothing 0.0         # Label smoothing 비활성화 (기본: 0.1)
 ```
 
 ## Checkpoint
@@ -368,6 +396,8 @@ pip install scikit-learn   # 선택 사항
 | `grad_clip_norm` | `float` | `1.0` | Gradient norm clipping. `0` = 비활성화 |
 | `early_stopping_patience` | `int` | `7` | Early stopping patience. `0` = 비활성화 |
 | `label_smoothing` | `float` | `0.1` | CrossEntropyLoss label smoothing |
+| `cutmix_p` | `float` | `0.0` | Same-label CutMix 적용 확률 (robust augmentation 전용, `0` = 비활성화) |
+| `cutmix_alpha` | `float` | `0.4` | CutMix lambda 샘플링용 Beta 분포 alpha |
 
 ### 저장 및 로깅
 
@@ -378,15 +408,21 @@ pip install scikit-learn   # 선택 사항
 | `log_dir` | `str` | `"./runs"` | TensorBoard 로그 디렉토리 |
 | `eval_every` | `int` | `1` | Validation 실행 간격 (epoch) |
 | `resume` | `str` | `""` | 학습 재개용 checkpoint 경로 |
+| `tb_log_images` | `bool` | `True` | 학습 이미지를 TensorBoard에 기록 |
+| `tb_log_images_per_epoch` | `int` | `5` | Epoch당 이미지 기록 횟수 |
+| `tb_log_images_count` | `int` | `8` | 그리드당 이미지 수 (single-view) |
+| `tb_log_images_pairs` | `int` | `4` | 그리드당 augmented/clean 쌍 수 (multi-view) |
 
 ### 분산 학습
 
 | 필드 | 타입 | 기본값 | 설명 |
 |------|------|--------|------|
 | `distributed` | `bool` | `False` | DDP 활성화 (`torchrun` 시 자동) |
+| `dp` | `bool` | `False` | `nn.DataParallel` 멀티 GPU (`torchrun` 불필요) |
 | `dist_backend` | `str` | `"nccl"` | `"nccl"` (GPU) 또는 `"gloo"` (CPU) |
 | `scale_lr` | `bool` | `False` | Linear LR scaling (lr × world_size) |
 | `sync_bn` | `bool` | `False` | SyncBatchNorm 변환 |
+| `seed` | `int` | `42` | 재현성을 위한 random seed |
 
 데이터, 모델 관련 옵션은 [dataloader.md](dataloader.md) 참조.
 
@@ -397,11 +433,14 @@ pip install scikit-learn   # 선택 사항
 ### 실행 방법
 
 ```bash
-# 2 GPU
+# 2 GPU (DDP, torchrun 필요)
 torchrun --nproc_per_node=2 train.py --batch_size 32
 
 # 4 GPU + LR scaling (lr × world_size)
 torchrun --nproc_per_node=4 train.py --batch_size 32 --lr 1e-4 --scale_lr
+
+# DataParallel (torchrun 없이 멀티 GPU)
+python train.py --dp --batch_size 64
 
 # 특정 GPU 지정
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py
