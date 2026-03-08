@@ -432,7 +432,7 @@ def train_one_epoch(
     ms_interval = getattr(args, "multiscale_interval", 0)
     use_iter_ms = getattr(args, "multiscale", False) and ms_interval > 0
     ms_sizes = getattr(args, "multiscale_sizes", [])
-    ms_base_size = getattr(args, "_multiscale_train_size", args.image_size)
+    ms_base_size = getattr(args, "_multiscale_train_size", getattr(args, "image_size", 224))
     current_ms_size = ms_base_size  # start at max (no downscale on first batch)
 
     # Same-label CutMix setup

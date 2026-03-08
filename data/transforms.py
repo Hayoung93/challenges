@@ -387,8 +387,11 @@ def get_train_transform(
             )
         return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
 
-    # Clean view: return geometric-only variant (no artifact transforms).
-    # Used by multi-view training to provide a clean anchor view.
+    # Clean view: return geometric-only variant (no artifact transforms,
+    # no color jitter).  Used by multi-view training to provide a stable
+    # anchor view.  Color perturbation is learned through the augmented
+    # view's CE loss; the anchor must stay colour-neutral so that the
+    # multi-view consistency loss (symmetrised KL) produces clean gradients.
     if clean_view:
         _GEOMETRIC_MAP = {
             "robust": _robust_geometric,
@@ -401,7 +404,11 @@ def get_train_transform(
         }
         geo_fn = _GEOMETRIC_MAP.get(augmentation)
         if geo_fn is not None:
-            return T.Compose(geo_fn(image_size) + _to_tensor_normalize())
+            geo_list = [
+                t for t in geo_fn(image_size)
+                if not isinstance(t, (T.ColorJitter, CurricularColorJitter))
+            ]
+            return T.Compose(geo_list + _to_tensor_normalize())
         # For other types (none, default, strong) fall through — they
         # are already artifact-free.
 
