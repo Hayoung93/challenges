@@ -2004,10 +2004,12 @@ class CurricularGroupedNOfCompose:
 class IntensityGaussianBlur:
     """Intensity-aware Gaussian blur. Scales sigma range with _intensity.
 
-    kernel_size is fixed; sigma range is scaled via _iscale_upper.
+    When ``kernel_size=0`` (default), OpenCV auto-computes the kernel
+    size from sigma so that the kernel always represents the Gaussian
+    faithfully regardless of sigma magnitude.
     """
 
-    def __init__(self, kernel_size=5, sigma=(0.1, 3.0), p=1.0):
+    def __init__(self, kernel_size=0, sigma=(0.1, 3.0), p=1.0):
         self.kernel_size = kernel_size
         self.sigma = sigma
         self.p = p

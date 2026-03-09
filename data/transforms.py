@@ -251,7 +251,7 @@ def _robust_artifact_groups() -> dict:
     """
     return {
         "blur": [
-            IntensityGaussianBlur(kernel_size=5, sigma=(0.1, 3.0)),
+            IntensityGaussianBlur(sigma=(0.1, 3.0)),
             RandomLensBlur(radius_range=(1, 6), p=1.0),
             RandomMotionBlur(kernel_size_range=(3, 15), p=1.0),
             RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
@@ -303,7 +303,7 @@ def _robust_artifact_groups_extended() -> dict:
     """
     return {
         "blur": [
-            IntensityGaussianBlur(kernel_size=5, sigma=(0.1, 10.0)),
+            IntensityGaussianBlur(sigma=(0.1, 10.0)),
             RandomLensBlur(radius_range=(1, 9), p=1.0),
             RandomMotionBlur(kernel_size_range=(3, 21), p=1.0),
             RandomMedianBlur(kernel_sizes=(3, 5, 7, 9), p=1.0),
