@@ -5,6 +5,156 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class FocalLoss(nn.Module):
+    """Focal Loss (Lin et al., 2017) with optional label smoothing.
+
+    Down-weights well-classified examples so training focuses on hard samples.
+    When ``gamma=0`` this reduces to standard cross-entropy.
+
+    Label smoothing is applied *before* computing the focal modulation factor
+    (pre-smoothing), so ``p_t`` is measured against the smoothed target
+    distribution.  This ensures ``FocalLoss(gamma=0, label_smoothing=s)``
+    is numerically identical to ``nn.CrossEntropyLoss(label_smoothing=s)``.
+
+    Args:
+        gamma: Focusing parameter (0 = standard CE, 2.0 typical).
+        alpha: Optional per-class weight tensor of shape ``(C,)``.
+        label_smoothing: Label smoothing factor.
+        reduction: ``"none"`` | ``"mean"`` | ``"sum"``.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
+        else:
+            self.alpha = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute focal loss.
+
+        Args:
+            logits: ``(B, C)`` raw class scores.
+            targets: ``(B,)`` integer class labels.
+
+        Returns:
+            Loss tensor whose shape depends on *reduction*.
+        """
+        C = logits.size(1)
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+
+        # Smoothed one-hot targets
+        with torch.no_grad():
+            targets_oh = torch.zeros_like(logits)
+            targets_oh.scatter_(1, targets.unsqueeze(1), 1.0)
+            if self.label_smoothing > 0.0:
+                targets_oh = (
+                    targets_oh * (1.0 - self.label_smoothing)
+                    + self.label_smoothing / C
+                )
+
+        # p_t: probability assigned to the (smoothed) target distribution
+        p_t = (probs * targets_oh).sum(dim=1)  # (B,)
+
+        # Focal modulating factor
+        focal_weight = (1.0 - p_t) ** self.gamma  # (B,)
+
+        # Per-sample CE with smoothed targets
+        ce = -(targets_oh * log_probs).sum(dim=1)  # (B,)
+
+        loss = focal_weight * ce  # (B,)
+
+        # Optional per-class alpha weighting
+        if self.alpha is not None:
+            alpha_t = self.alpha.gather(0, targets)
+            loss = alpha_t * loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+class HardSampleMiningLoss(nn.Module):
+    """In-batch online hard sample mining wrapper.
+
+    Computes per-sample loss via the wrapped *base_loss*, then keeps only the
+    top-k hardest samples (highest loss) for gradient computation.
+
+    When ``keep_ratio=1.0`` this is a transparent pass-through.
+
+    Args:
+        base_loss: Loss module that supports ``reduction="none"``.
+        keep_ratio: Fraction of batch to keep ``(0, 1]``.
+        min_keep: Minimum samples to keep regardless of *keep_ratio*.
+    """
+
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        keep_ratio: float = 1.0,
+        min_keep: int = 4,
+    ):
+        super().__init__()
+        self.base_loss = base_loss
+        self.keep_ratio = keep_ratio
+        self.min_keep = min_keep
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute hard-mined loss.
+
+        Args:
+            logits: ``(B, C)`` raw class scores.
+            targets: ``(B,)`` integer class labels.
+
+        Returns:
+            Scalar loss averaged over the kept (hard) samples.
+        """
+        # Temporarily switch base_loss to per-sample mode
+        old_reduction = self.base_loss.reduction
+        self.base_loss.reduction = "none"
+        try:
+            per_sample = self.base_loss(logits, targets)  # (B,)
+        finally:
+            self.base_loss.reduction = old_reduction
+
+        B = per_sample.size(0)
+
+        if self.keep_ratio >= 1.0 or B <= self.min_keep:
+            return per_sample.mean()
+
+        k = max(int(B * self.keep_ratio + 0.5), self.min_keep)
+        k = min(k, B)
+
+        topk_losses, _ = torch.topk(per_sample, k, sorted=False)
+        return topk_losses.mean()
+
+    def mine(self, per_sample_losses: torch.Tensor) -> torch.Tensor:
+        """Apply top-k selection on pre-computed per-sample losses.
+
+        Useful when the caller needs to combine per-sample losses from
+        multiple sources (e.g. multi-view) before mining.
+        """
+        B = per_sample_losses.size(0)
+        if self.keep_ratio >= 1.0 or B <= self.min_keep:
+            return per_sample_losses.mean()
+        k = max(int(B * self.keep_ratio + 0.5), self.min_keep)
+        k = min(k, B)
+        topk, _ = torch.topk(per_sample_losses, k, sorted=False)
+        return topk.mean()
+
+
 class SupConLoss(nn.Module):
     """Supervised Contrastive Loss (Khosla et al., 2020).
 
@@ -134,12 +284,16 @@ class MultiViewCriterion(nn.Module):
         temperature: float = 0.07,
         label_smoothing: float = 0.0,
         mvc_ema: bool = False,
+        ce_criterion: nn.Module | None = None,
     ):
         super().__init__()
         self.lambda_con = lambda_con
         self.lambda_mvc = lambda_mvc
         self.mvc_ema = mvc_ema
-        self.ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        if ce_criterion is not None:
+            self.ce = ce_criterion
+        else:
+            self.ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         self.supcon = SupConLoss(temperature=temperature)
         self.mvc = MultiViewConsistencyLoss(teacher_student=mvc_ema)
 
@@ -171,6 +325,18 @@ class MultiViewCriterion(nn.Module):
         if self.mvc_ema:
             # EMA mode: CE on student only
             ce_loss = self.ce(logits1, labels)
+        elif isinstance(self.ce, HardSampleMiningLoss):
+            # Unified mining: combine per-sample CE from both views,
+            # then apply a single top-k selection so the same samples
+            # are kept for both views.
+            base = self.ce.base_loss
+            old_reduction = base.reduction
+            base.reduction = "none"
+            try:
+                combined = 0.5 * (base(logits1, labels) + base(logits2, labels))
+            finally:
+                base.reduction = old_reduction
+            ce_loss = self.ce.mine(combined)
         else:
             ce_loss = 0.5 * (self.ce(logits1, labels) + self.ce(logits2, labels))
 
@@ -194,3 +360,38 @@ class MultiViewCriterion(nn.Module):
             "mvc": mvc_loss.item(),
         }
         return total, components
+
+
+def build_criterion(args) -> nn.Module:
+    """Build the training loss criterion from config flags.
+
+    Returns one of:
+
+    * ``nn.CrossEntropyLoss`` — default (``focal_gamma=0``, ``ohsm_enabled=False``)
+    * ``FocalLoss`` — ``focal_gamma > 0`` only
+    * ``HardSampleMiningLoss(CrossEntropyLoss)`` — ``ohsm_enabled``, ``focal_gamma=0``
+    * ``HardSampleMiningLoss(FocalLoss)`` — both enabled
+    """
+    label_smoothing = getattr(args, "label_smoothing", 0.1)
+    focal_gamma = getattr(args, "focal_gamma", 0.0)
+    ohsm_enabled = getattr(args, "ohsm_enabled", False)
+    ohsm_keep_ratio = getattr(args, "ohsm_keep_ratio", 1.0)
+    ohsm_min_keep = getattr(args, "ohsm_min_keep", 4)
+
+    if focal_gamma > 0.0:
+        base_loss = FocalLoss(
+            gamma=focal_gamma,
+            label_smoothing=label_smoothing,
+            reduction="mean",
+        )
+    else:
+        base_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    if ohsm_enabled and ohsm_keep_ratio < 1.0:
+        return HardSampleMiningLoss(
+            base_loss=base_loss,
+            keep_ratio=ohsm_keep_ratio,
+            min_keep=ohsm_min_keep,
+        )
+
+    return base_loss

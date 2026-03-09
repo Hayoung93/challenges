@@ -100,6 +100,15 @@ DEFAULTS = {
     "cutmix_p": 0.0,       # 0.0 = disabled by default
     "cutmix_alpha": 0.4,   # Beta distribution alpha
 
+    # Online Hard Sample Mining (OHSM)
+    "ohsm_enabled": False,            # Master switch for in-batch hard mining
+    "focal_gamma": 0.0,               # Focal loss gamma (0.0 = standard CE)
+    "ohsm_keep_ratio": 0.7,           # Fraction of batch to keep (1.0 = no mining)
+    "ohsm_min_keep": 4,               # Minimum samples to keep per batch
+    "ohsm_curriculum": False,          # Ramp keep_ratio from 1.0 -> ohsm_keep_ratio
+    "ohsm_curriculum_ratio": None,     # OHSM schedule length (None = use curriculum_ratio)
+    "ohsm_curriculum_start_epoch": 0,  # Epoch to start OHSM curriculum
+
     # TensorBoard image logging
     "tb_log_images": True,
     "tb_log_images_per_epoch": 5,  # how many times per epoch to log input images
@@ -324,6 +333,36 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--cutmix_alpha", type=float, default=DEFAULTS["cutmix_alpha"],
                     help="Beta distribution alpha for CutMix lambda sampling "
                          "(smaller = smaller cuts on average)")
+    # Online Hard Sample Mining (OHSM)
+    g.add_argument("--ohsm_enabled", action="store_true",
+                    default=DEFAULTS["ohsm_enabled"],
+                    help="Enable in-batch online hard sample mining (loss-level)")
+    g.add_argument("--no_ohsm_enabled", dest="ohsm_enabled",
+                    action="store_false")
+    g.add_argument("--focal_gamma", type=float,
+                    default=DEFAULTS["focal_gamma"],
+                    help="Focal loss gamma (0.0=standard CE, 2.0 typical). "
+                         "Can be used independently without --ohsm_enabled")
+    g.add_argument("--ohsm_keep_ratio", type=float,
+                    default=DEFAULTS["ohsm_keep_ratio"],
+                    help="Fraction of batch to keep in hard mining "
+                         "(1.0=all, 0.5=top 50%%)")
+    g.add_argument("--ohsm_min_keep", type=int,
+                    default=DEFAULTS["ohsm_min_keep"],
+                    help="Minimum samples to keep per batch regardless of ratio")
+    g.add_argument("--ohsm_curriculum", action="store_true",
+                    default=DEFAULTS["ohsm_curriculum"],
+                    help="Ramp keep_ratio from 1.0 to ohsm_keep_ratio over "
+                         "ohsm_curriculum_ratio epochs")
+    g.add_argument("--no_ohsm_curriculum", dest="ohsm_curriculum",
+                    action="store_false")
+    g.add_argument("--ohsm_curriculum_ratio", type=float,
+                    default=DEFAULTS["ohsm_curriculum_ratio"],
+                    help="Fraction of total epochs for OHSM curriculum "
+                         "(default: use --curriculum_ratio)")
+    g.add_argument("--ohsm_curriculum_start_epoch", type=int,
+                    default=DEFAULTS["ohsm_curriculum_start_epoch"],
+                    help="Epoch at which OHSM curriculum begins ramping")
     # TensorBoard image logging
     g.add_argument("--tb_log_images", action="store_true",
                     default=DEFAULTS["tb_log_images"],

@@ -82,6 +82,27 @@ def print_rank0(msg, args):
         print(msg)
 
 
+def _update_ohsm_ratio(criterion: nn.Module, ratio: float) -> None:
+    """Update *keep_ratio* on a :class:`HardSampleMiningLoss`, if present."""
+    from losses import HardSampleMiningLoss
+
+    if isinstance(criterion, HardSampleMiningLoss):
+        criterion.keep_ratio = ratio
+    elif hasattr(criterion, "ce") and isinstance(criterion.ce, HardSampleMiningLoss):
+        criterion.ce.keep_ratio = ratio
+
+
+def _get_ohsm_ratio(criterion: nn.Module):
+    """Return current *keep_ratio* or ``None`` if OHSM is not active."""
+    from losses import HardSampleMiningLoss
+
+    if isinstance(criterion, HardSampleMiningLoss):
+        return criterion.keep_ratio
+    if hasattr(criterion, "ce") and isinstance(criterion.ce, HardSampleMiningLoss):
+        return criterion.ce.keep_ratio
+    return None
+
+
 def gather_predictions(local_probs: torch.Tensor, local_labels: torch.Tensor) -> tuple:
     """Gather predictions and labels from all ranks.
 
@@ -484,6 +505,8 @@ def train_one_epoch(
             current_ms_size = random.choice(ms_sizes)
             from models.classifier import update_mambavision_window_size
             update_mambavision_window_size(model, current_ms_size)
+            if ema_teacher is not None:
+                update_mambavision_window_size(ema_teacher, current_ms_size)
 
         if use_multi_view:
             views1, views2, labels, _metadata = batch
@@ -855,6 +878,10 @@ def main():
 
     # Loss, optimizer, scheduler, scaler
     val_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    from losses import build_criterion
+    ce_criterion = build_criterion(args)
+
     if getattr(args, "multi_view", False):
         from losses import MultiViewCriterion
 
@@ -864,6 +891,7 @@ def main():
             temperature=args.con_temperature,
             label_smoothing=args.label_smoothing,
             mvc_ema=getattr(args, "mvc_ema", False),
+            ce_criterion=ce_criterion,
         )
         print_rank0(
             f"  Multi-view criterion: lambda_con={args.lambda_con}, "
@@ -872,7 +900,16 @@ def main():
             args,
         )
     else:
-        criterion = val_criterion
+        criterion = ce_criterion
+
+    if getattr(args, "focal_gamma", 0.0) > 0 or getattr(args, "ohsm_enabled", False):
+        print_rank0(
+            f"  OHSM: focal_gamma={getattr(args, 'focal_gamma', 0.0)}, "
+            f"mining={'on' if getattr(args, 'ohsm_enabled', False) else 'off'}, "
+            f"keep_ratio={getattr(args, 'ohsm_keep_ratio', 1.0)}, "
+            f"curriculum={getattr(args, 'ohsm_curriculum', False)}",
+            args,
+        )
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, steps_per_epoch)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -985,6 +1022,8 @@ def main():
 
             from models.classifier import update_mambavision_window_size
             update_mambavision_window_size(model, current_scale)
+            if ema_teacher is not None:
+                update_mambavision_window_size(ema_teacher, current_scale)
 
             print_rank0(
                 f"  Multi-scale: epoch {epoch} -> {current_scale}x{current_scale}",
@@ -996,6 +1035,24 @@ def main():
             sampler = train_loader.sampler
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
+
+        # OHSM curriculum: ramp keep_ratio from 1.0 -> target
+        if getattr(args, "ohsm_enabled", False) and getattr(args, "ohsm_curriculum", False):
+            _ohsm_target = getattr(args, "ohsm_keep_ratio", 0.7)
+            _ohsm_start = getattr(args, "ohsm_curriculum_start_epoch", 0)
+            _ohsm_cr = getattr(args, "ohsm_curriculum_ratio", None)
+            if _ohsm_cr is None:
+                _ohsm_cr = getattr(args, "curriculum_ratio", 0.5)
+            _ohsm_end = int(args.epochs * _ohsm_cr)
+            if epoch < _ohsm_start:
+                _cur_ratio = 1.0
+            elif epoch >= _ohsm_end:
+                _cur_ratio = _ohsm_target
+            else:
+                _progress = (epoch - _ohsm_start) / max(_ohsm_end - _ohsm_start, 1)
+                _cur_ratio = 1.0 - _progress * (1.0 - _ohsm_target)
+            _update_ohsm_ratio(criterion, _cur_ratio)
+            print_rank0(f"  OHSM curriculum: keep_ratio={_cur_ratio:.3f}", args)
 
         # Train
         train_metrics = train_one_epoch(
@@ -1015,6 +1072,10 @@ def main():
             for key in ("loss_ce", "loss_supcon", "loss_mvc"):
                 if key in train_metrics:
                     writer.add_scalar(f"train/{key}", train_metrics[key], epoch)
+            # OHSM keep_ratio tracking
+            _ohsm_r = _get_ohsm_ratio(criterion)
+            if _ohsm_r is not None:
+                writer.add_scalar("train/ohsm_keep_ratio", _ohsm_r, epoch)
 
         # Validate
         val_metrics = None
