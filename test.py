@@ -177,10 +177,11 @@ def print_metrics(metrics, subset_name="val"):
 
 # Keys that affect model architecture — mismatch likely causes errors or silent bugs.
 _CRITICAL_KEYS = [
-    ("model_name",   "Model architecture"),
-    ("num_classes",  "Number of classes"),
-    ("lora_enabled", "LoRA enabled"),
-    ("wsgm",         "WSGM enabled"),
+    ("model_name",       "Model architecture"),
+    ("num_classes",      "Number of classes"),
+    ("lora_enabled",     "LoRA enabled"),
+    ("convlora_enabled", "ConvLoRA enabled"),
+    ("wsgm",             "WSGM enabled"),
 ]
 
 # Keys that affect inference quality — mismatch may degrade results.
@@ -190,6 +191,9 @@ _WARN_KEYS = [
     ("lora_alpha",            "LoRA alpha"),
     ("lora_dropout",          "LoRA dropout"),
     ("lora_target_modules",   "LoRA target modules"),
+    ("convlora_rank",         "ConvLoRA rank"),
+    ("convlora_alpha",        "ConvLoRA alpha"),
+    ("convlora_dropout",      "ConvLoRA dropout"),
     ("wsgm_reduction_factor", "WSGM reduction factor"),
     ("wsgm_dropout",          "WSGM dropout"),
     ("wsgm_aggregation",      "WSGM aggregation"),

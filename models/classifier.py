@@ -158,8 +158,14 @@ class GenAIClassifier(nn.Module):
         lora_alpha: LoRA scaling numerator.
         lora_dropout: Dropout on the LoRA branch.
         lora_target_modules: Override the default target module suffixes.
+        convlora_enabled: Attach ConvLoRA adapters to depthwise Conv2d
+            layers (DINOv3 ConvNeXt only).  Can be combined with
+            ``lora_enabled``.
+        convlora_rank: ConvLoRA rank *r*.
+        convlora_alpha: ConvLoRA scaling numerator.
+        convlora_dropout: Dropout on the ConvLoRA branch.
         wsgm: Attach WSGM adapters to the backbone (DINOv3 only).
-            Mutually exclusive with ``lora_enabled``.
+            Mutually exclusive with ``lora_enabled`` and ``convlora_enabled``.
         wsgm_reduction_factor: WSGM bottleneck = embed_dim // factor.
         wsgm_dropout: Dropout probability in WSGM modules.
         wsgm_aggregation: ``"average"`` or ``"concat"``.
@@ -180,6 +186,10 @@ class GenAIClassifier(nn.Module):
         lora_alpha: float = 8.0,
         lora_dropout: float = 0.0,
         lora_target_modules: list | None = None,
+        convlora_enabled: bool = False,
+        convlora_rank: int = 4,
+        convlora_alpha: float = 4.0,
+        convlora_dropout: float = 0.0,
         wsgm: bool = False,
         wsgm_reduction_factor: int = 4,
         wsgm_dropout: float = 0.5,
@@ -202,6 +212,8 @@ class GenAIClassifier(nn.Module):
         # Mutual exclusion
         if wsgm and lora_enabled:
             raise ValueError("--wsgm and --lora_enabled are mutually exclusive")
+        if wsgm and convlora_enabled:
+            raise ValueError("--wsgm and --convlora_enabled are mutually exclusive")
 
         if model_name in _DINOV3_WEIGHTS:
             # --- DINOv3 backbone ---
@@ -229,6 +241,7 @@ class GenAIClassifier(nn.Module):
         # WSGM wraps the backbone with its own classifier head;
         # otherwise replace the head normally.
         self.lora_enabled = lora_enabled
+        self.convlora_enabled = convlora_enabled
         self.wsgm_enabled = wsgm
 
         if wsgm:
@@ -266,6 +279,27 @@ class GenAIClassifier(nn.Module):
                     target_modules=lora_target_modules or None,
                 )
 
+            # ConvLoRA — adapt depthwise Conv2d layers (ConvNeXt only).
+            if convlora_enabled:
+                if model_name not in _DINOV3_WEIGHTS:
+                    raise ValueError(
+                        "ConvLoRA is only supported for DINOv3 models"
+                    )
+                if not model_name.startswith("dinov3_convnext"):
+                    raise ValueError(
+                        "ConvLoRA targets dwconv layers available only "
+                        "in DINOv3 ConvNeXt models, not ViT"
+                    )
+                from .lora import apply_convlora_to_model
+
+                apply_convlora_to_model(
+                    self.backbone,
+                    model_name,
+                    rank=convlora_rank,
+                    alpha=convlora_alpha,
+                    dropout=convlora_dropout,
+                )
+
             if freeze_backbone:
                 self._freeze_backbone()
 
@@ -286,11 +320,13 @@ class GenAIClassifier(nn.Module):
             self.projection_head = None
 
     def _freeze_backbone(self):
-        """Freeze all parameters except the classification head (and LoRA)."""
+        """Freeze all parameters except the head, LoRA, and ConvLoRA."""
         for name, param in self.backbone.named_parameters():
             if name.startswith("head."):
                 continue
             if self.lora_enabled and ("lora_down" in name or "lora_up" in name):
+                continue
+            if self.convlora_enabled and ("lora_A" in name or "lora_B" in name):
                 continue
             param.requires_grad = False
 
@@ -326,14 +362,14 @@ class GenAIClassifier(nn.Module):
                     f"backbone.{k}": v for k, v in state_dict.items()
                 }
 
-        # Remap non-LoRA checkpoint keys to LoRA model structure.
+        # Remap non-LoRA checkpoint keys to LoRA / ConvLoRA model structure.
         # E.g. "blocks.0.attn.qkv.weight" → "blocks.0.attn.qkv.original.weight"
-        if self.lora_enabled:
-            from .lora import LoRALinear
+        if self.lora_enabled or self.convlora_enabled:
+            from .lora import LoRAConv2d, LoRALinear
 
             lora_names = {
                 n for n, m in self.backbone.named_modules()
-                if isinstance(m, LoRALinear)
+                if isinstance(m, (LoRALinear, LoRAConv2d))
             }
             remapped = {}
             for k, v in state_dict.items():
@@ -441,6 +477,10 @@ def build_model(args) -> GenAIClassifier:
         lora_alpha=getattr(args, "lora_alpha", 8.0),
         lora_dropout=getattr(args, "lora_dropout", 0.0),
         lora_target_modules=getattr(args, "lora_target_modules", None) or None,
+        convlora_enabled=getattr(args, "convlora_enabled", False),
+        convlora_rank=getattr(args, "convlora_rank", 4),
+        convlora_alpha=getattr(args, "convlora_alpha", 4.0),
+        convlora_dropout=getattr(args, "convlora_dropout", 0.0),
         wsgm=getattr(args, "wsgm", False),
         wsgm_reduction_factor=getattr(args, "wsgm_reduction_factor", 4),
         wsgm_dropout=getattr(args, "wsgm_dropout", 0.5),

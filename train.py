@@ -817,6 +817,11 @@ def main():
         args.freeze_backbone = True
         print_rank0("  LoRA enabled: auto-freezing backbone", args)
 
+    # ConvLoRA implies frozen backbone
+    if getattr(args, "convlora_enabled", False) and not args.freeze_backbone:
+        args.freeze_backbone = True
+        print_rank0("  ConvLoRA enabled: auto-freezing backbone", args)
+
     # WSGM implies frozen backbone
     if getattr(args, "wsgm", False) and not args.freeze_backbone:
         args.freeze_backbone = True
@@ -852,12 +857,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print_rank0(f"  Total params: {total_params:,}", args)
     print_rank0(f"  Trainable params: {trainable_params:,}", args)
-    if getattr(args, "lora_enabled", False):
+    if getattr(args, "lora_enabled", False) or getattr(args, "convlora_enabled", False):
         from models.lora import count_lora_params
 
         raw_model = model.module if hasattr(model, "module") else model
         _, _, lora_params = count_lora_params(raw_model)
-        print_rank0(f"  LoRA params: {lora_params:,}", args)
+        print_rank0(f"  LoRA + ConvLoRA params: {lora_params:,}", args)
     if getattr(args, "wsgm", False):
         from models.wsgm import count_wsgm_params
 

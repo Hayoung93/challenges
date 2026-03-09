@@ -72,6 +72,12 @@ DEFAULTS = {
     "lora_dropout": 0.0,
     "lora_target_modules": [],  # empty = architecture defaults
 
+    # ConvLoRA (depthwise conv adaptation)
+    "convlora_enabled": False,
+    "convlora_rank": 4,
+    "convlora_alpha": 4.0,
+    "convlora_dropout": 0.0,
+
     # WSGM
     "wsgm": False,
     "wsgm_reduction_factor": 4,
@@ -275,6 +281,21 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--lora_target_modules", nargs="+",
                     default=DEFAULTS["lora_target_modules"],
                     help="Override LoRA target module suffixes")
+    g.add_argument("--convlora_enabled", action="store_true",
+                    default=DEFAULTS["convlora_enabled"],
+                    help="Enable ConvLoRA adapters on depthwise Conv2d "
+                         "(DINOv3 ConvNeXt only)")
+    g.add_argument("--no_convlora_enabled", dest="convlora_enabled",
+                    action="store_false")
+    g.add_argument("--convlora_rank", type=int,
+                    default=DEFAULTS["convlora_rank"],
+                    help="ConvLoRA rank r (2, 4 recommended)")
+    g.add_argument("--convlora_alpha", type=float,
+                    default=DEFAULTS["convlora_alpha"],
+                    help="ConvLoRA scaling factor (scaling = alpha / rank)")
+    g.add_argument("--convlora_dropout", type=float,
+                    default=DEFAULTS["convlora_dropout"],
+                    help="Dropout on ConvLoRA branch")
     g.add_argument("--wsgm", action="store_true",
                     default=DEFAULTS["wsgm"],
                     help="Enable WSGM adapters (DINOv3 only)")
