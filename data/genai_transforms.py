@@ -309,6 +309,144 @@ class RandomResizeOrCrop:
         )
 
 
+class RandomSmallCropReflectPad:
+    """Simulate small test images by cropping a tiny region and reflect-padding.
+
+    With probability ``p``, crops a random square region of a random small
+    size from the input image, then symmetrically reflect-pads it to
+    ``target_size``.  This simulates what happens at test time when very
+    small images (48-192 px) are reflect-padded to the model's input size.
+
+    The crop preserves original pixels (no interpolation), and the
+    reflect padding mirrors edge pixels — matching the inference
+    pipeline's :class:`ReflectPadIfSmaller` behaviour.
+
+    Args:
+        target_size: Output spatial size (typically ``image_size``).
+        crop_range: ``(min_crop, max_crop)`` pixel range for the random
+            small crop size.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, target_size: int = 224,
+                 crop_range: tuple = (48, 192), p: float = 0.1):
+        self.target_size = target_size
+        self.crop_range = crop_range
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        w, h = img.size
+        min_dim = min(w, h)
+        # Clamp crop range to image dimensions
+        lo = min(self.crop_range[0], min_dim)
+        hi = min(self.crop_range[1], min_dim)
+        crop_size = random.randint(lo, max(lo, hi))
+
+        # Random crop position
+        left = random.randint(0, max(0, w - crop_size))
+        top = random.randint(0, max(0, h - crop_size))
+        cropped = TF.crop(img, top, left, crop_size, crop_size)
+
+        # Reflect-pad to target_size.  PIL reflect padding requires
+        # pad < image_dim, so we pad iteratively when the crop is very
+        # small relative to target_size.
+        return self._iterative_reflect_pad(cropped, self.target_size)
+
+    @staticmethod
+    def _iterative_reflect_pad(img: Image.Image,
+                               target_size: int) -> Image.Image:
+        """Reflect-pad *img* to ``(target_size, target_size)``.
+
+        PIL's ``reflect`` padding mode requires the pad amount to be
+        strictly less than the image dimension.  For very small crops
+        (e.g. 48 px → 224 px) this is violated, so we apply padding in
+        multiple rounds, each time padding by at most ``dim - 1`` pixels.
+        """
+        w, h = img.size
+        while w < target_size or h < target_size:
+            pad_w = min(w - 1, max(0, target_size - w))
+            pad_h = min(h - 1, max(0, target_size - h))
+            pad_left = pad_w // 2
+            pad_top = pad_h // 2
+            img = TF.pad(
+                img,
+                [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top],
+                padding_mode="reflect",
+            )
+            w, h = img.size
+
+        # Final center-crop to exact target_size if slightly oversized
+        # from rounding during iterative padding.
+        if w > target_size or h > target_size:
+            left = (w - target_size) // 2
+            top = (h - target_size) // 2
+            img = TF.crop(img, top, left, target_size, target_size)
+
+        return img
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"target_size={self.target_size}, "
+            f"crop_range={self.crop_range}, p={self.p})"
+        )
+
+
+class ResizeOrCropWithSmallPad:
+    """Randomly choose between normal resize/crop and small-crop + reflect-pad.
+
+    With probability ``small_pad_p``, delegates to
+    :class:`RandomSmallCropReflectPad` which simulates very small test
+    images.  Otherwise delegates to :class:`RandomResizeOrCrop`.
+
+    When the small-pad path fires, the output is already at
+    ``target_size``, so downstream transforms (flip, colour jitter, etc.)
+    apply normally.
+
+    Args:
+        target_size: Output spatial size.
+        crop_p: Probability of crop+pad path in ``RandomResizeOrCrop``.
+        scale: Area fraction range for the resize path.
+        small_pad_p: Probability of using the small-crop+reflect-pad path.
+        small_crop_range: ``(min, max)`` pixel range for small crops.
+        padding_mode: Padding mode for the normal crop path.
+    """
+
+    def __init__(self, target_size: int, crop_p: float = 0.5,
+                 scale: tuple = (0.5, 1.0), small_pad_p: float = 0.1,
+                 small_crop_range: tuple = (48, 192),
+                 padding_mode: str = "reflect"):
+        self.resize_or_crop = RandomResizeOrCrop(
+            target_size, crop_p=crop_p, scale=scale,
+            padding_mode=padding_mode,
+        )
+        self.small_pad = RandomSmallCropReflectPad(
+            target_size=target_size,
+            crop_range=small_crop_range,
+            p=1.0,  # probability managed by this wrapper
+        )
+        self.target_size = target_size
+        self.small_pad_p = small_pad_p
+        self.small_crop_range = small_crop_range
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() < self.small_pad_p:
+            return self.small_pad(img)
+        return self.resize_or_crop(img)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"target_size={self.target_size}, "
+            f"small_pad_p={self.small_pad_p}, "
+            f"small_crop_range={self.small_crop_range}, "
+            f"inner={self.resize_or_crop})"
+        )
+
+
 class CurricularWrapper:
     """Wrap transforms and scale their probability by training progress.
 

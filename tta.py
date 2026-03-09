@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-TTA_MODES = ["none", "flip", "multiscale", "full", "full_legacy"]
+TTA_MODES = ["none", "flip", "multiscale", "full", "full_legacy", "multicrop"]
 
 DEFAULT_SCALES = [256, 288, 320]
 
@@ -76,11 +76,114 @@ def _has_prep_margin(tensor: torch.Tensor, image_size: int) -> bool:
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _generate_multicrop_grid(
+    h: int,
+    w: int,
+    crop_size: int,
+    stride_ratio: float = 0.75,
+    max_crops: int = 36,
+) -> List[tuple]:
+    """Compute grid positions for uniform crop coverage.
+
+    Returns a list of ``(top, left)`` positions such that crops at those
+    positions cover the entire ``(h, w)`` image with controlled overlap.
+
+    Args:
+        h: Image height.
+        w: Image width.
+        crop_size: Square crop size.
+        stride_ratio: Stride as a fraction of ``crop_size``.
+            0.75 means 25 % overlap between adjacent crops.
+        max_crops: Maximum number of crop positions.  If the grid
+            exceeds this, stride is increased to fit.
+
+    Returns:
+        List of ``(top, left)`` integer tuples.
+    """
+    if h <= crop_size and w <= crop_size:
+        top = max(0, (h - crop_size) // 2)
+        left = max(0, (w - crop_size) // 2)
+        return [(top, left)]
+
+    stride = max(1, int(crop_size * stride_ratio))
+
+    def _positions_1d(length: int, cs: int, s: int) -> List[int]:
+        if length <= cs:
+            return [max(0, (length - cs) // 2)]
+        pos = list(range(0, length - cs, s))
+        # Always include the last position to cover the edge
+        if pos[-1] + cs < length:
+            pos.append(length - cs)
+        return pos
+
+    y_positions = _positions_1d(h, crop_size, stride)
+    x_positions = _positions_1d(w, crop_size, stride)
+    total = len(y_positions) * len(x_positions)
+
+    # If grid is too large, increase stride to fit within budget
+    while total > max_crops and stride < max(h, w):
+        stride = int(stride * 1.25)
+        y_positions = _positions_1d(h, crop_size, stride)
+        x_positions = _positions_1d(w, crop_size, stride)
+        total = len(y_positions) * len(x_positions)
+
+    grid = [(y, x) for y in y_positions for x in x_positions]
+    return grid[:max_crops]
+
+
+def _generate_multicrop_views(
+    images: torch.Tensor,
+    image_size: int,
+    stride_ratio: float = 0.75,
+    max_crops: int = 36,
+    flip: bool = True,
+) -> List[torch.Tensor]:
+    """Generate a uniform grid of crops covering the entire image.
+
+    For large images, this produces significantly better spatial coverage
+    than center + 4 corners.  Each crop is a pixel-preserving tensor
+    slice (no interpolation).
+
+    Args:
+        images: Input ``(B, C, H, W)`` tensor (B should be 1 for
+            variable crop counts, enforced by the TTA data pipeline).
+        image_size: Square crop size.
+        stride_ratio: Stride as a fraction of ``image_size``.
+        max_crops: Maximum total views (including flips).
+        flip: Include horizontally-flipped versions of each crop.
+
+    Returns:
+        List of ``(B, C, image_size, image_size)`` tensors.
+    """
+    _, _, h, w = images.shape
+
+    # Account for flip doubling when computing grid budget
+    grid_budget = max_crops // 2 if flip else max_crops
+
+    grid = _generate_multicrop_grid(
+        h, w, image_size,
+        stride_ratio=stride_ratio,
+        max_crops=grid_budget,
+    )
+
+    views: List[torch.Tensor] = []
+    for top, left in grid:
+        crop = images[:, :, top:top + image_size, left:left + image_size]
+        views.append(crop)
+        if flip:
+            views.append(torch.flip(crop, dims=[-1]))
+
+    return views
+
+
 def generate_augmented_views(
     images: torch.Tensor,
     tta_mode: str,
     image_size: int = 224,
     scales: Optional[List[int]] = None,
+    multicrop_stride_ratio: float = 0.75,
+    multicrop_max_crops: int = 36,
+    multicrop_flip: bool = True,
 ) -> List[torch.Tensor]:
     """Generate augmented views of the input batch.
 
@@ -91,9 +194,12 @@ def generate_augmented_views(
 
     Args:
         images: Original batch ``(B, C, H, W)``, already normalized.
-        tta_mode: One of ``"none"``, ``"flip"``, ``"multiscale"``, ``"full"``.
+        tta_mode: One of the :data:`TTA_MODES`.
         image_size: Spatial size the model expects.
         scales: Resize targets for multi-scale crops.
+        multicrop_stride_ratio: Stride fraction for ``"multicrop"`` mode.
+        multicrop_max_crops: Maximum views for ``"multicrop"`` mode.
+        multicrop_flip: Include flips in ``"multicrop"`` mode.
 
     Returns:
         List of ``(B, C, image_size, image_size)`` tensors.
@@ -119,6 +225,18 @@ def generate_augmented_views(
                     f"TTA scale {scale} is smaller than image_size {image_size}. "
                     f"All scales must be >= image_size."
                 )
+
+    # multicrop: grid-based crop coverage for large images
+    if tta_mode == "multicrop":
+        if _has_prep_margin(images, image_size):
+            return _generate_multicrop_views(
+                images, image_size,
+                stride_ratio=multicrop_stride_ratio,
+                max_crops=multicrop_max_crops,
+                flip=multicrop_flip,
+            )
+        # Image too small for grid — fall back to full prep views
+        return _generate_prep_views(images, "full", image_size, scales)
 
     # full_legacy: rotation-based views; scale views from native resolution
     if tta_mode == "full_legacy":
@@ -254,6 +372,9 @@ def tta_forward(
     tta_mode: str,
     image_size: int = 224,
     scales: Optional[List[int]] = None,
+    multicrop_stride_ratio: float = 0.75,
+    multicrop_max_crops: int = 36,
+    multicrop_flip: bool = True,
 ) -> torch.Tensor:
     """Run TTA-augmented forward pass and return averaged logits.
 
@@ -267,6 +388,9 @@ def tta_forward(
         tta_mode: TTA strategy name.
         image_size: Expected model input spatial size.
         scales: Multi-scale resize targets.
+        multicrop_stride_ratio: Stride fraction for ``"multicrop"`` mode.
+        multicrop_max_crops: Maximum views for ``"multicrop"`` mode.
+        multicrop_flip: Include flips in ``"multicrop"`` mode.
 
     Returns:
         Averaged logits of shape ``(B, num_classes)``.
@@ -277,7 +401,12 @@ def tta_forward(
     if tta_mode == "none" and _has_prep_margin(images, image_size):
         return model(_center_crop(images, image_size))
 
-    views = generate_augmented_views(images, tta_mode, image_size, scales)
+    views = generate_augmented_views(
+        images, tta_mode, image_size, scales,
+        multicrop_stride_ratio=multicrop_stride_ratio,
+        multicrop_max_crops=multicrop_max_crops,
+        multicrop_flip=multicrop_flip,
+    )
 
     logits_sum = None
     for view in views:

@@ -120,6 +120,9 @@ def run_ensemble_inference(
     use_amp=True,
     image_size=224,
     method="mean_prob",
+    multicrop_stride_ratio=0.75,
+    multicrop_max_crops=36,
+    multicrop_flip=True,
 ):
     """Run ensemble inference with per-model TTA.
 
@@ -149,7 +152,10 @@ def run_ensemble_inference(
         batch_logits = []  # (n_models, batch_size, n_classes)
         for model, tta_mode, _w in models:
             with autocast(device_type="cuda", enabled=use_amp):
-                logits = tta_forward(model, images, tta_mode, image_size=image_size)
+                logits = tta_forward(model, images, tta_mode, image_size=image_size,
+                                     multicrop_stride_ratio=multicrop_stride_ratio,
+                                     multicrop_max_crops=multicrop_max_crops,
+                                     multicrop_flip=multicrop_flip)
             batch_logits.append(logits)
 
         # Stack: (n_models, B, C)
@@ -270,7 +276,8 @@ def generate_score_csv(predictions, output_path):
 
 @torch.no_grad()
 def evaluate_ensemble_val(
-    models, dataloader, device, use_amp=True, image_size=224, method="mean_prob"
+    models, dataloader, device, use_amp=True, image_size=224, method="mean_prob",
+    multicrop_stride_ratio=0.75, multicrop_max_crops=36, multicrop_flip=True,
 ):
     """Evaluate ensemble on labeled data. Returns dict with metrics."""
     all_preds = []
@@ -284,7 +291,10 @@ def evaluate_ensemble_val(
         batch_logits = []
         for model, tta_mode, _w in models:
             with autocast(device_type="cuda", enabled=use_amp):
-                logits = tta_forward(model, images, tta_mode, image_size=image_size)
+                logits = tta_forward(model, images, tta_mode, image_size=image_size,
+                                     multicrop_stride_ratio=multicrop_stride_ratio,
+                                     multicrop_max_crops=multicrop_max_crops,
+                                     multicrop_flip=multicrop_flip)
             batch_logits.append(logits)
 
         stacked = torch.stack(batch_logits, dim=0)  # (M, B, C)
@@ -412,6 +422,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    mc_kwargs = {
+        "multicrop_stride_ratio": getattr(args, "multicrop_stride_ratio", 0.75),
+        "multicrop_max_crops": getattr(args, "multicrop_max_crops", 36),
+        "multicrop_flip": getattr(args, "multicrop_flip", True),
+    }
+
     if isinstance(test_loader, dict):
         # Mode 3: dict of DataLoaders
         all_predictions = []
@@ -420,6 +436,7 @@ def main():
             preds = run_ensemble_inference(
                 models, loader, device, args.amp,
                 image_size=args.image_size, method=args.ensemble_method,
+                **mc_kwargs,
             )
             csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
             generate_csv(preds, csv_path)
@@ -439,6 +456,7 @@ def main():
         preds = run_ensemble_inference(
             models, test_loader, device, args.amp,
             image_size=args.image_size, method=args.ensemble_method,
+            **mc_kwargs,
         )
         mode_names = {1: "val_images", 2: "val_images_hard"}
         subset_name = mode_names.get(args.ntire_test_mode, "test")
@@ -458,12 +476,14 @@ def main():
                 metrics = evaluate_ensemble_val(
                     models, loader, device, args.amp,
                     image_size=args.image_size, method=args.ensemble_method,
+                    **mc_kwargs,
                 )
                 print_metrics(metrics, subset_name)
         else:
             metrics = evaluate_ensemble_val(
                 models, val_loader, device, args.amp,
                 image_size=args.image_size, method=args.ensemble_method,
+                **mc_kwargs,
             )
             print_metrics(metrics, "val")
 

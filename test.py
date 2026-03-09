@@ -21,7 +21,9 @@ from tta import tta_forward
 
 
 @torch.no_grad()
-def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", image_size=224):
+def run_inference(model, dataloader, device, use_amp=True, tta_mode="none",
+                  image_size=224, multicrop_stride_ratio=0.75,
+                  multicrop_max_crops=36, multicrop_flip=True):
     """Run inference on a single DataLoader.
 
     Args:
@@ -29,8 +31,11 @@ def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", imag
         dataloader: DataLoader yielding ``(images, labels, metadata)``.
         device: ``torch.device`` to run on.
         use_amp: Enable automatic mixed precision.
-        tta_mode: TTA strategy — ``"none"``, ``"flip"``, ``"multiscale"``, or ``"full"``.
+        tta_mode: TTA strategy name.
         image_size: Model input spatial size (for multi-scale TTA crops).
+        multicrop_stride_ratio: Stride fraction for ``"multicrop"`` TTA.
+        multicrop_max_crops: Maximum views for ``"multicrop"`` TTA.
+        multicrop_flip: Include flips in ``"multicrop"`` TTA.
 
     Returns:
         List of ``(image_name, predicted_label, score)`` tuples where
@@ -43,7 +48,10 @@ def run_inference(model, dataloader, device, use_amp=True, tta_mode="none", imag
         images = images.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = tta_forward(model, images, tta_mode, image_size=image_size)
+            logits = tta_forward(model, images, tta_mode, image_size=image_size,
+                                 multicrop_stride_ratio=multicrop_stride_ratio,
+                                 multicrop_max_crops=multicrop_max_crops,
+                                 multicrop_flip=multicrop_flip)
 
         probs = torch.softmax(logits, dim=1)[:, 1]
         preds = logits.argmax(dim=1)
@@ -96,7 +104,9 @@ def generate_score_csv(predictions, output_path):
 
 
 @torch.no_grad()
-def evaluate_val(model, dataloader, device, use_amp=True, tta_mode="none", image_size=224):
+def evaluate_val(model, dataloader, device, use_amp=True, tta_mode="none",
+                 image_size=224, multicrop_stride_ratio=0.75,
+                 multicrop_max_crops=36, multicrop_flip=True):
     """Evaluate on labeled data. Returns dict with metrics."""
     model.eval()
     all_preds = []
@@ -107,7 +117,10 @@ def evaluate_val(model, dataloader, device, use_amp=True, tta_mode="none", image
         images = images.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=use_amp):
-            logits = tta_forward(model, images, tta_mode, image_size=image_size)
+            logits = tta_forward(model, images, tta_mode, image_size=image_size,
+                                 multicrop_stride_ratio=multicrop_stride_ratio,
+                                 multicrop_max_crops=multicrop_max_crops,
+                                 multicrop_flip=multicrop_flip)
 
         probs = torch.softmax(logits, dim=1)[:, 1]
         preds = logits.argmax(dim=1)
@@ -181,6 +194,7 @@ _WARN_KEYS = [
     ("wsgm_dropout",          "WSGM dropout"),
     ("wsgm_aggregation",      "WSGM aggregation"),
     ("drop_rate",             "Dropout rate"),
+    ("small_pad_p",           "Small image augmentation prob"),
 ]
 
 
@@ -249,6 +263,74 @@ def verify_checkpoint_config(checkpoint_path, current_args):
     return ckpt_args
 
 
+def check_inference_consistency(ckpt_args, current_args):
+    """Warn about logical mismatches between training config and inference settings.
+
+    Unlike :func:`verify_checkpoint_config` (which compares identical keys),
+    this checks *cross-key* consistency — e.g. whether the TTA mode is
+    appropriate given the training augmentation strategy.
+
+    Two scenarios trigger a blocking confirmation prompt:
+
+    1. Model trained with ``small_pad_p > 0`` but ``--tta none``:
+       Small test images will be bilinear-resized instead of reflect-padded,
+       which contradicts what the model learned during training.
+
+    2. TTA mode that reflect-pads small images, but model trained with
+       ``small_pad_p == 0``: The model never saw reflect-padded patterns,
+       so small-image predictions may be unreliable.
+
+    Args:
+        ckpt_args: Training args dict from checkpoint, or ``None``.
+        current_args: Current inference ``argparse.Namespace``.
+    """
+    if ckpt_args is None:
+        return
+
+    tta_mode = getattr(current_args, "tta", "none")
+    ckpt_small_pad_p = ckpt_args.get("small_pad_p", 0.0)
+
+    issues = []
+
+    # Case 1: trained with small-image augmentation but TTA won't reflect-pad
+    if ckpt_small_pad_p > 0 and tta_mode == "none":
+        issues.append(
+            f"Model was trained with small image augmentation "
+            f"(small_pad_p={ckpt_small_pad_p}), but --tta is 'none'.\n"
+            f"      Small test images will be bilinear-resized instead of "
+            f"reflect-padded,\n"
+            f"      which mismatches the training distribution.\n"
+            f"      Recommendation: use --tta multicrop (or --tta flip at minimum)."
+        )
+
+    # Case 2: TTA will reflect-pad, but model never saw padded images
+    if tta_mode != "none" and ckpt_small_pad_p == 0:
+        issues.append(
+            f"Using --tta '{tta_mode}' which reflect-pads small images, "
+            f"but the model\n"
+            f"      was trained without small image augmentation "
+            f"(small_pad_p=0).\n"
+            f"      The model may not classify reflect-padded small images "
+            f"accurately.\n"
+            f"      Recommendation: retrain with --small_pad_p 0.1 "
+            f"(or higher)."
+        )
+
+    if not issues:
+        return
+
+    print(f"\n{'!' * 60}")
+    print("  Inference consistency warning")
+    print(f"{'!' * 60}")
+    for issue in issues:
+        print(f"\n  >> {issue}")
+    print(f"\n{'!' * 60}\n")
+
+    answer = input("Continue with current settings? [y/N]: ").strip().lower()
+    if answer != "y":
+        raise SystemExit("Aborted by user due to inference consistency warning.")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
@@ -289,6 +371,7 @@ def main():
 
     # Verify checkpoint config against current args
     ckpt_args = verify_checkpoint_config(args.checkpoint_path, args)
+    check_inference_consistency(ckpt_args, args)
 
     # Model
     print(f"Model: {args.model_name}")
@@ -310,13 +393,20 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    mc_kwargs = {
+        "multicrop_stride_ratio": getattr(args, "multicrop_stride_ratio", 0.75),
+        "multicrop_max_crops": getattr(args, "multicrop_max_crops", 36),
+        "multicrop_flip": getattr(args, "multicrop_flip", True),
+    }
+
     if isinstance(test_loader, dict):
         # Mode 3: dict of DataLoaders
         all_predictions = []
         for subset_name, loader in test_loader.items():
             print(f"\nRunning inference on {subset_name}...")
             preds = run_inference(model, loader, device, args.amp,
-                                  tta_mode=args.tta, image_size=args.image_size)
+                                  tta_mode=args.tta, image_size=args.image_size,
+                                  **mc_kwargs)
             csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
             generate_csv(preds, csv_path)
             if args.output_scores:
@@ -333,7 +423,8 @@ def main():
         # Mode 1 or 2: single DataLoader
         print("\nRunning inference...")
         preds = run_inference(model, test_loader, device, args.amp,
-                              tta_mode=args.tta, image_size=args.image_size)
+                              tta_mode=args.tta, image_size=args.image_size,
+                              **mc_kwargs)
         mode_names = {1: "val_images", 2: "val_images_hard"}
         subset_name = mode_names.get(args.ntire_test_mode, "test")
         csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
@@ -350,11 +441,13 @@ def main():
         if isinstance(val_loader, dict):
             for subset_name, loader in val_loader.items():
                 metrics = evaluate_val(model, loader, device, args.amp,
-                                       tta_mode=args.tta, image_size=args.image_size)
+                                       tta_mode=args.tta, image_size=args.image_size,
+                                       **mc_kwargs)
                 print_metrics(metrics, subset_name)
         else:
             metrics = evaluate_val(model, val_loader, device, args.amp,
-                                   tta_mode=args.tta, image_size=args.image_size)
+                                   tta_mode=args.tta, image_size=args.image_size,
+                                   **mc_kwargs)
             print_metrics(metrics, "val")
 
     print("Done.")

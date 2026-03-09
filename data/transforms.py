@@ -32,6 +32,7 @@ from .genai_transforms import (
     RandomPNGReencode,
     RandomPosterize,
     RandomResizeOrCrop,
+    ResizeOrCropWithSmallPad,
     RandomSaltPepperNoise,
     RandomSharpen,
     RandomSpatialJitter,
@@ -144,14 +145,29 @@ def _strong_geometric(image_size: int) -> list:
     ]
 
 
-def _genai_geometric(image_size: int, crop_p: float = 0.5) -> list:
+def _genai_geometric(image_size: int, crop_p: float = 0.5,
+                     small_pad_p: float = 0.0,
+                     small_crop_range: tuple = (48, 192)) -> list:
     """Geometric + color augmentations for genai pipelines.
 
     Uses ``RandomResizeOrCrop`` instead of ``RandomResizedCrop`` to
     preserve pixel-level artifacts that are critical for GenAI detection.
+
+    When ``small_pad_p > 0``, uses :class:`ResizeOrCropWithSmallPad`
+    to randomly simulate very small test images that are reflect-padded
+    to ``image_size``.
     """
+    if small_pad_p > 0:
+        first_transform = ResizeOrCropWithSmallPad(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+            small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+        )
+    else:
+        first_transform = RandomResizeOrCrop(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+        )
     return [
-        RandomResizeOrCrop(image_size, crop_p=crop_p, scale=(0.5, 1.0)),
+        first_transform,
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
         T.RandomRotation(degrees=15),
@@ -186,12 +202,18 @@ def _augly_artifact_pool() -> list:
 
 
 def _robust_geometric(image_size: int, crop_p: float = 0.5,
-                      color_jitter=None) -> list:
+                      color_jitter=None,
+                      small_pad_p: float = 0.0,
+                      small_crop_range: tuple = (48, 192)) -> list:
     """Geometric + color augmentations for robust pipelines.
 
     Same as :func:`_genai_geometric` but with rotation removed entirely
     to avoid destroying pixel-level artifacts that robust augmentation
     is designed to preserve.
+
+    When ``small_pad_p > 0``, uses :class:`ResizeOrCropWithSmallPad`
+    to randomly simulate very small test images that are reflect-padded
+    to ``image_size``.
 
     Args:
         image_size: Target square output size.
@@ -199,13 +221,25 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
         color_jitter: Optional replacement for the default
             ``T.ColorJitter``.  Pass a :class:`CurricularColorJitter`
             to make colour perturbation curriculum-aware.
+        small_pad_p: Probability of small-crop+reflect-pad path
+            (0.0 = disabled).
+        small_crop_range: ``(min, max)`` pixel range for small crops.
     """
     if color_jitter is None:
         color_jitter = T.ColorJitter(
             brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2,
         )
+    if small_pad_p > 0:
+        first_transform = ResizeOrCropWithSmallPad(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+            small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+        )
+    else:
+        first_transform = RandomResizeOrCrop(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+        )
     return [
-        RandomResizeOrCrop(image_size, crop_p=crop_p, scale=(0.5, 1.0)),
+        first_transform,
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
         color_jitter,
@@ -345,6 +379,8 @@ def get_train_transform(
     curriculum_n_max_end: int = 7,
     scale_state=None,
     clean_view: bool = False,
+    small_pad_p: float = 0.0,
+    small_crop_range: tuple = (48, 192),
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -369,6 +405,9 @@ def get_train_transform(
         clean_view: When ``True``, returns the geometric-only variant
             of the requested augmentation (no artifact transforms).
             Used by multi-view training to provide a clean anchor view.
+        small_pad_p: Probability of small-crop+reflect-pad augmentation
+            (0.0 = disabled).  Simulates very small test images.
+        small_crop_range: ``(min, max)`` pixel range for small crops.
     """
     # Multi-scale: wrap with dynamic resolution dispatch
     if scale_state is not None:
@@ -384,6 +423,8 @@ def get_train_transform(
                 curriculum_n_max_end=curriculum_n_max_end,
                 scale_state=None,  # prevent recursion
                 clean_view=clean_view,
+                small_pad_p=small_pad_p,
+                small_crop_range=small_crop_range,
             )
         return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
 
@@ -404,8 +445,9 @@ def get_train_transform(
         }
         geo_fn = _GEOMETRIC_MAP.get(augmentation)
         if geo_fn is not None:
+            # Clean view: no small-pad simulation (anchor must be stable)
             geo_list = [
-                t for t in geo_fn(image_size)
+                t for t in geo_fn(image_size, small_pad_p=0.0)
                 if not isinstance(t, (T.ColorJitter, CurricularColorJitter))
             ]
             return T.Compose(geo_list + _to_tensor_normalize())
@@ -433,7 +475,8 @@ def get_train_transform(
         )
     elif augmentation == "genai":
         return T.Compose(
-            _genai_geometric(image_size)
+            _genai_geometric(image_size, small_pad_p=small_pad_p,
+                             small_crop_range=small_crop_range)
             + [
                 RandomJPEGCompression(quality_range=(30, 95), p=0.5),
                 RandomDownscaleUpscale(scale_range=(0.5, 0.9), p=0.3),
@@ -471,13 +514,15 @@ def get_train_transform(
             curriculum_ratio=curriculum_ratio,
         )
         return T.Compose(
-            _genai_geometric(image_size)
+            _genai_geometric(image_size, small_pad_p=small_pad_p,
+                             small_crop_range=small_crop_range)
             + [curricular, sp_curricular]
             + _to_tensor_normalize()
         )
     elif augmentation == "augly":
         return T.Compose(
-            _genai_geometric(image_size)
+            _genai_geometric(image_size, small_pad_p=small_pad_p,
+                             small_crop_range=small_crop_range)
             + [RandomNOfCompose(_augly_artifact_pool(), n=5)]
             + _to_tensor_normalize()
         )
@@ -486,7 +531,8 @@ def get_train_transform(
             import multiprocessing
             epoch_state = multiprocessing.Value("i", 0)
         return T.Compose(
-            _genai_geometric(image_size)
+            _genai_geometric(image_size, small_pad_p=small_pad_p,
+                             small_crop_range=small_crop_range)
             + [
                 CurricularNOfCompose(
                     _augly_artifact_pool(),
@@ -505,7 +551,8 @@ def get_train_transform(
             weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
         )
         return T.Compose(
-            _robust_geometric(image_size)
+            _robust_geometric(image_size, small_pad_p=small_pad_p,
+                              small_crop_range=small_crop_range)
             + [artifact_compose]
             + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
@@ -528,7 +575,8 @@ def get_train_transform(
             clean_p_end=0.1,
         )
         return T.Compose(
-            _robust_geometric(image_size)
+            _robust_geometric(image_size, small_pad_p=small_pad_p,
+                              small_crop_range=small_crop_range)
             + [artifact_compose]
             + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
@@ -559,7 +607,9 @@ def get_train_transform(
             intensity_curriculum=True,
         )
         return T.Compose(
-            _robust_geometric(image_size, color_jitter=curricular_cj)
+            _robust_geometric(image_size, color_jitter=curricular_cj,
+                              small_pad_p=small_pad_p,
+                              small_crop_range=small_crop_range)
             + [artifact_compose]
             + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.08))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]

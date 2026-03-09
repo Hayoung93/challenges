@@ -34,6 +34,11 @@ DEFAULTS = {
     "curriculum_n_max_start": 3,  # upper bound at epoch 0
     "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
+    # Small-crop reflect-pad augmentation (simulates tiny test images)
+    "small_pad_p": 0.1,
+    "small_crop_range_min": 48,
+    "small_crop_range_max": 192,
+
     # Multi-scale training
     "multiscale": False,
     "multiscale_sizes": [224, 256, 288, 320, 384, 448, 512],
@@ -112,6 +117,9 @@ DEFAULTS = {
     "output_dir": "./predictions",
     "tta": "none",
     "tta_min_prep_size": 512,  # Minimum prep size; images >= this kept at native resolution
+    "multicrop_stride_ratio": 0.75,  # stride as fraction of crop size (0.75 = 25% overlap)
+    "multicrop_max_crops": 36,       # maximum total views for multicrop TTA
+    "multicrop_flip": True,          # include flipped versions in multicrop
     "eval_val": False,
     "output_scores": False,
 
@@ -171,6 +179,16 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["curriculum_n_max_end"],
                     help="Upper bound of group count at curriculum completion "
                          "(used by robust_curriculum_range)")
+    g.add_argument("--small_pad_p", type=float,
+                    default=DEFAULTS["small_pad_p"],
+                    help="Probability of small-crop+reflect-pad augmentation "
+                         "during training (0.0 = disabled, 0.1 recommended)")
+    g.add_argument("--small_crop_range_min", type=int,
+                    default=DEFAULTS["small_crop_range_min"],
+                    help="Minimum crop size for small-pad augmentation")
+    g.add_argument("--small_crop_range_max", type=int,
+                    default=DEFAULTS["small_crop_range_max"],
+                    help="Maximum crop size for small-pad augmentation")
     g.add_argument("--multiscale", action="store_true",
                     default=DEFAULTS["multiscale"],
                     help="Enable multi-scale training (resolution changes per epoch)")
@@ -348,15 +366,28 @@ def add_test_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Directory for CSV prediction output")
     g.add_argument("--tta", type=str, nargs="?", const="flip",
                     default=DEFAULTS["tta"],
-                    choices=["none", "flip", "multiscale", "full", "full_legacy"],
+                    choices=["none", "flip", "multiscale", "full",
+                             "full_legacy", "multicrop"],
                     help="TTA mode: none, flip, multiscale, full (pixel-preserving), "
-                         "or full_legacy (rotation-based). "
+                         "full_legacy (rotation-based), or multicrop (grid coverage). "
                          "(default: none; --tta without value means 'flip')")
     g.add_argument("--tta_min_prep_size", type=int,
                     default=DEFAULTS["tta_min_prep_size"],
                     help="Minimum prep tensor size. Images smaller than this are "
                          "reflect-padded; larger images kept at native resolution. "
                          "(default: 512)")
+    g.add_argument("--multicrop_stride_ratio", type=float,
+                    default=DEFAULTS["multicrop_stride_ratio"],
+                    help="Stride as fraction of crop size for multicrop TTA "
+                         "(0.75 = 25%% overlap)")
+    g.add_argument("--multicrop_max_crops", type=int,
+                    default=DEFAULTS["multicrop_max_crops"],
+                    help="Maximum total views for multicrop TTA")
+    g.add_argument("--multicrop_flip", action="store_true",
+                    default=DEFAULTS["multicrop_flip"],
+                    help="Include flipped versions in multicrop TTA")
+    g.add_argument("--no_multicrop_flip", dest="multicrop_flip",
+                    action="store_false")
     g.add_argument("--eval_val", action="store_true", default=DEFAULTS["eval_val"],
                     help="Run evaluation on labeled validation data")
     g.add_argument("--no_eval_val", dest="eval_val", action="store_false")
@@ -387,7 +418,8 @@ def add_ensemble_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
                     help="Ensemble aggregation strategy")
     g.add_argument("--ensemble_tta", nargs="+", type=str,
                     default=DEFAULTS["ensemble_tta"],
-                    choices=["none", "flip", "multiscale", "full", "full_legacy"],
+                    choices=["none", "flip", "multiscale", "full",
+                             "full_legacy", "multicrop"],
                     help="Per-model TTA modes (default: use --tta for all)")
     return parser
 

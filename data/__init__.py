@@ -71,6 +71,11 @@ def build_dataset(name: str, args, split: str = "train",
             curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
+            small_pad_p=getattr(args, "small_pad_p", 0.0),
+            small_crop_range=(
+                getattr(args, "small_crop_range_min", 48),
+                getattr(args, "small_crop_range_max", 192),
+            ),
         )
     else:
         transform = _get_inference_transform(args)
@@ -325,6 +330,7 @@ def build_train_val_loaders(
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
             clean_view=True,
+            small_pad_p=0.0,  # clean anchor view: no small-pad simulation
         )
         for name in dataset_names:
             train_transform_datasets[name] = MultiViewDataset(
