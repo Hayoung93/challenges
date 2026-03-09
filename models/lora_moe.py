@@ -109,15 +109,16 @@ class LoRAMoELinear(nn.Module):
             masks = self._expert_masks  # (B, K)
             dropped_x = self.lora_dropout(x)
 
-            # Memory optimisation: skip inactive experts.
+            # Compute per-expert deltas.  Even inactive experts run a
+            # dummy forward (multiplied by 0) so their parameters remain
+            # in the autograd graph — required for DDP with
+            # find_unused_parameters=False.
             deltas = []
             for k in range(self.num_experts):
-                if masks[:, k].any():
-                    deltas.append(
-                        self.lora_ups[k](self.lora_downs[k](dropped_x))
-                    )
-                else:
-                    deltas.append(torch.zeros_like(base_out))
+                delta = self.lora_ups[k](self.lora_downs[k](dropped_x))
+                if not masks[:, k].any():
+                    delta = delta * 0
+                deltas.append(delta)
 
             stacked = torch.stack(deltas, dim=0)  # (K, B, ..., D_out)
 
@@ -235,28 +236,27 @@ class LoRAMoEConv2d(nn.Module):
             masks = self._expert_masks  # (B, K)
             B = x.shape[0]
 
+            # Compute per-expert deltas.  Inactive experts still run a
+            # dummy forward (* 0) to keep parameters in the autograd
+            # graph for DDP with find_unused_parameters=False.
             delta_outputs = []
             for k in range(self.num_experts):
-                if masks[:, k].any():
-                    delta_w = self._delta_weight(k)
-                    if self.training and self.lora_dropout is not None:
-                        delta_outputs.append(
-                            F.conv2d(
-                                self.lora_dropout(x), delta_w, None,
-                                self.original.stride, self.original.padding,
-                                self.original.dilation, self.original.groups,
-                            )
-                        )
-                    else:
-                        delta_outputs.append(
-                            F.conv2d(
-                                x, delta_w, None,
-                                self.original.stride, self.original.padding,
-                                self.original.dilation, self.original.groups,
-                            )
-                        )
+                delta_w = self._delta_weight(k)
+                if self.training and self.lora_dropout is not None:
+                    delta_out = F.conv2d(
+                        self.lora_dropout(x), delta_w, None,
+                        self.original.stride, self.original.padding,
+                        self.original.dilation, self.original.groups,
+                    )
                 else:
-                    delta_outputs.append(torch.zeros_like(base_out))
+                    delta_out = F.conv2d(
+                        x, delta_w, None,
+                        self.original.stride, self.original.padding,
+                        self.original.dilation, self.original.groups,
+                    )
+                if not masks[:, k].any():
+                    delta_out = delta_out * 0
+                delta_outputs.append(delta_out)
 
             stacked = torch.stack(delta_outputs, dim=0)  # (K, B, C_out, H', W')
             # (K, B, 1, 1, 1)
