@@ -87,6 +87,16 @@ DEFAULTS = {
     # Mixture of Experts
     "moe_enabled": False,
 
+    # LoRA-MoE (expert LoRA adapters in backbone)
+    "lora_moe_enabled": False,
+    "lora_moe_num_experts": 8,
+    "lora_moe_rank": 8,
+    "lora_moe_alpha": 8.0,
+    "lora_moe_dropout": 0.0,
+    "lora_moe_convlora_rank": 4,
+    "lora_moe_convlora_alpha": 4.0,
+    "lora_moe_convlora_dropout": 0.0,
+
     # Training hyperparameters
     "lr": 1e-4,
     "weight_decay": 0.05,
@@ -320,6 +330,33 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "(requires robust augmentation mode)")
     g.add_argument("--no_moe_enabled", dest="moe_enabled",
                     action="store_false")
+    g.add_argument("--lora_moe_enabled", action="store_true",
+                    default=DEFAULTS["lora_moe_enabled"],
+                    help="Enable LoRA-MoE: K expert LoRA adapter sets in "
+                         "backbone (DINOv3 only)")
+    g.add_argument("--no_lora_moe_enabled", dest="lora_moe_enabled",
+                    action="store_false")
+    g.add_argument("--lora_moe_num_experts", type=int,
+                    default=DEFAULTS["lora_moe_num_experts"],
+                    help="Number of LoRA-MoE experts (default 8)")
+    g.add_argument("--lora_moe_rank", type=int,
+                    default=DEFAULTS["lora_moe_rank"],
+                    help="LoRA-MoE rank r (4, 8, 16 recommended)")
+    g.add_argument("--lora_moe_alpha", type=float,
+                    default=DEFAULTS["lora_moe_alpha"],
+                    help="LoRA-MoE scaling factor (scaling = alpha / rank)")
+    g.add_argument("--lora_moe_dropout", type=float,
+                    default=DEFAULTS["lora_moe_dropout"],
+                    help="Dropout on LoRA-MoE branch")
+    g.add_argument("--lora_moe_convlora_rank", type=int,
+                    default=DEFAULTS["lora_moe_convlora_rank"],
+                    help="ConvLoRA-MoE rank for dwconv (ConvNeXt, auto-enabled)")
+    g.add_argument("--lora_moe_convlora_alpha", type=float,
+                    default=DEFAULTS["lora_moe_convlora_alpha"],
+                    help="ConvLoRA-MoE scaling factor")
+    g.add_argument("--lora_moe_convlora_dropout", type=float,
+                    default=DEFAULTS["lora_moe_convlora_dropout"],
+                    help="Dropout on ConvLoRA-MoE branch")
     return parser
 
 
@@ -540,5 +577,17 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError(
                 f"--moe_enabled requires --augmentation robust/robust_curriculum/"
                 f"robust_curriculum_range, got '{aug}'"
+            )
+    # LoRA-MoE requires grouped augmentation (robust variants).
+    if getattr(args, "lora_moe_enabled", False):
+        aug = getattr(args, "augmentation", "default")
+        if aug not in ("robust", "robust_curriculum", "robust_curriculum_range"):
+            raise ValueError(
+                f"--lora_moe_enabled requires --augmentation robust/"
+                f"robust_curriculum/robust_curriculum_range, got '{aug}'"
+            )
+        if getattr(args, "multi_view", False):
+            raise ValueError(
+                "--lora_moe_enabled and --multi_view are mutually exclusive"
             )
     return args

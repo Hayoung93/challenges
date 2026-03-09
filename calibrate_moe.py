@@ -1,4 +1,4 @@
-"""Post-training temperature calibration for MoE expert heads.
+"""Post-training temperature calibration for MoE / LoRA-MoE expert heads.
 
 Optimises a per-expert temperature scalar ``tau_k`` on a held-out
 validation set by minimising the negative log-likelihood:
@@ -12,10 +12,18 @@ uses them.
 
 Usage::
 
+    # Head MoE
     python calibrate_moe.py \\
         --checkpoint_path checkpoints/moe_run/best_auc.pth \\
         --model_name dinov3_convnext_base \\
         --moe_enabled \\
+        [--batch_size 64] [--num_workers 8]
+
+    # LoRA-MoE
+    python calibrate_moe.py \\
+        --checkpoint_path checkpoints/lora_moe_run/best_auc.pth \\
+        --model_name dinov3_vitb16 \\
+        --lora_moe_enabled \\
         [--batch_size 64] [--num_workers 8]
 """
 
@@ -77,6 +85,46 @@ def collect_logits_and_labels(model, val_loader, device, use_amp=True):
     return torch.cat(logits_list), torch.cat(labels_list)
 
 
+@torch.no_grad()
+def collect_lora_moe_logits(model, val_loader, device, num_experts=8,
+                            use_amp=True):
+    """Collect per-expert logits for LoRA-MoE via K forward passes.
+
+    Each expert's LoRA adapters are activated individually to extract
+    expert-specific features and logits.
+
+    Returns:
+        all_logits: ``(N, K, C)`` tensor of raw expert logits.
+        all_labels: ``(N,)`` tensor of ground-truth labels.
+    """
+    from models.lora_moe import clear_lora_moe_state, set_active_expert
+
+    raw = model.module if hasattr(model, "module") else model
+    model.eval()
+
+    logits_list = []
+    labels_list = []
+
+    for batch in tqdm(val_loader, desc="Collecting LoRA-MoE logits",
+                      leave=False):
+        images, labels, _ = batch
+        images = images.to(device, non_blocking=True)
+
+        expert_logits = []
+        for k in range(num_experts):
+            set_active_expert(model, k)
+            with torch.autocast(device_type="cuda", enabled=use_amp):
+                features = raw._extract_features(images)
+                logits_k = raw.backbone.head(features)  # (B, C)
+            expert_logits.append(logits_k.float().cpu())
+        clear_lora_moe_state(model)
+
+        logits_list.append(torch.stack(expert_logits, dim=1))  # (B, K, C)
+        labels_list.append(labels)
+
+    return torch.cat(logits_list), torch.cat(labels_list)
+
+
 def calibrate_temperatures(all_logits, all_labels):
     """Find optimal temperature per expert via 1-D NLL minimisation.
 
@@ -126,8 +174,14 @@ def main():
     args = parser.parse_args()
     args = merge_config(args)
 
-    if not getattr(args, "moe_enabled", False):
-        logger.error("--moe_enabled must be set for temperature calibration")
+    use_moe = getattr(args, "moe_enabled", False)
+    use_lora_moe = getattr(args, "lora_moe_enabled", False)
+
+    if not use_moe and not use_lora_moe:
+        logger.error(
+            "--moe_enabled or --lora_moe_enabled must be set for "
+            "temperature calibration"
+        )
         sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,27 +202,42 @@ def main():
     model.eval()
 
     # Build validation loader only
-    # Use a temporary args copy with moe_enabled=False for val transforms
-    # (val transforms don't need tracking)
+    # Use a temporary args copy with moe/lora_moe disabled for val transforms
     val_args = copy.deepcopy(args)
     val_args.moe_enabled = False
+    val_args.lora_moe_enabled = False
     _, val_loader = build_train_val_loaders(val_args)
 
     logger.info("Collecting expert logits on %d validation samples...",
                 len(val_loader.dataset))
 
-    all_logits, all_labels = collect_logits_and_labels(
-        model, val_loader, device, use_amp=getattr(args, "amp", True),
-    )
+    if use_lora_moe:
+        raw = model.module if hasattr(model, "module") else model
+        num_experts = raw.lora_moe_num_experts
+        all_logits, all_labels = collect_lora_moe_logits(
+            model, val_loader, device,
+            num_experts=num_experts,
+            use_amp=getattr(args, "amp", True),
+        )
+    else:
+        all_logits, all_labels = collect_logits_and_labels(
+            model, val_loader, device, use_amp=getattr(args, "amp", True),
+        )
 
     logger.info("Optimising per-expert temperatures...")
     optimal_temps = calibrate_temperatures(all_logits, all_labels)
 
     # Write calibrated temperatures back into checkpoint
-    moe_head = _get_moe_head(model)
-    moe_head.log_temperatures.data = torch.log(
-        torch.tensor(optimal_temps, dtype=torch.float32),
-    )
+    raw = model.module if hasattr(model, "module") else model
+    if use_lora_moe:
+        raw.lora_moe_log_temperatures.data = torch.log(
+            torch.tensor(optimal_temps, dtype=torch.float32),
+        )
+    else:
+        moe_head = _get_moe_head(model)
+        moe_head.log_temperatures.data = torch.log(
+            torch.tensor(optimal_temps, dtype=torch.float32),
+        )
 
     # Save updated checkpoint
     output_path = checkpoint_path.replace(".pth", "_calibrated.pth")

@@ -199,6 +199,14 @@ class GenAIClassifier(nn.Module):
         wsgm_aggregation: str = "average",
         projection_dim: int = 0,
         moe_enabled: bool = False,
+        lora_moe_enabled: bool = False,
+        lora_moe_num_experts: int = 8,
+        lora_moe_rank: int = 8,
+        lora_moe_alpha: float = 8.0,
+        lora_moe_dropout: float = 0.0,
+        lora_moe_convlora_rank: int = 4,
+        lora_moe_convlora_alpha: float = 4.0,
+        lora_moe_convlora_dropout: float = 0.0,
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -220,6 +228,14 @@ class GenAIClassifier(nn.Module):
             raise ValueError("--wsgm and --convlora_enabled are mutually exclusive")
         if moe_enabled and wsgm:
             raise ValueError("--moe_enabled and --wsgm are mutually exclusive")
+        if lora_moe_enabled and lora_enabled:
+            raise ValueError("--lora_moe_enabled and --lora_enabled are mutually exclusive")
+        if lora_moe_enabled and convlora_enabled:
+            raise ValueError("--lora_moe_enabled and --convlora_enabled are mutually exclusive")
+        if lora_moe_enabled and moe_enabled:
+            raise ValueError("--lora_moe_enabled and --moe_enabled are mutually exclusive")
+        if lora_moe_enabled and wsgm:
+            raise ValueError("--lora_moe_enabled and --wsgm are mutually exclusive")
 
         if model_name in _DINOV3_WEIGHTS:
             # --- DINOv3 backbone ---
@@ -250,6 +266,7 @@ class GenAIClassifier(nn.Module):
         self.convlora_enabled = convlora_enabled
         self.wsgm_enabled = wsgm
         self.moe_enabled = moe_enabled
+        self.lora_moe_enabled = lora_moe_enabled
 
         if wsgm:
             if model_name not in _DINOV3_WEIGHTS:
@@ -272,6 +289,47 @@ class GenAIClassifier(nn.Module):
 
                 self.backbone.head = nn.Identity()
                 self.moe_head = MoEHead(num_features, num_classes)
+            elif lora_moe_enabled:
+                if model_name not in _DINOV3_WEIGHTS:
+                    raise ValueError(
+                        "LoRA-MoE is only supported for DINOv3 models"
+                    )
+                from .lora_moe import (
+                    apply_convlora_moe_to_model,
+                    apply_lora_moe_to_model,
+                )
+
+                # Shared classification head.
+                self.backbone.head = nn.Linear(num_features, num_classes)
+                trunc_normal_(self.backbone.head.weight, std=0.02)
+                nn.init.zeros_(self.backbone.head.bias)
+
+                # LoRA-MoE on attn.qkv/proj or pwconv1/2.
+                apply_lora_moe_to_model(
+                    self.backbone, model_name,
+                    num_experts=lora_moe_num_experts,
+                    rank=lora_moe_rank,
+                    alpha=lora_moe_alpha,
+                    dropout=lora_moe_dropout,
+                    target_modules=lora_target_modules or None,
+                )
+
+                # ConvNeXt: ConvLoRA-MoE auto-enabled on dwconv.
+                if model_name.startswith("dinov3_convnext"):
+                    apply_convlora_moe_to_model(
+                        self.backbone, model_name,
+                        num_experts=lora_moe_num_experts,
+                        rank=lora_moe_convlora_rank,
+                        alpha=lora_moe_convlora_alpha,
+                        dropout=lora_moe_convlora_dropout,
+                    )
+
+                # Per-expert temperature (frozen during training,
+                # optimised post-hoc via calibrate_moe.py).
+                self.lora_moe_log_temperatures = nn.Parameter(
+                    torch.zeros(lora_moe_num_experts), requires_grad=False,
+                )
+                self.lora_moe_num_experts = lora_moe_num_experts
             else:
                 self.backbone.head = nn.Linear(num_features, num_classes)
                 trunc_normal_(self.backbone.head.weight, std=0.02)
@@ -333,13 +391,18 @@ class GenAIClassifier(nn.Module):
             self._load_checkpoint(checkpoint_path)
 
     def _freeze_backbone(self):
-        """Freeze all parameters except the head, LoRA, and ConvLoRA."""
+        """Freeze all parameters except the head, LoRA, ConvLoRA, and LoRA-MoE."""
         for name, param in self.backbone.named_parameters():
             if name.startswith("head."):
                 continue
             if self.lora_enabled and ("lora_down" in name or "lora_up" in name):
                 continue
             if self.convlora_enabled and ("lora_A" in name or "lora_B" in name):
+                continue
+            if self.lora_moe_enabled and (
+                "lora_downs" in name or "lora_ups" in name
+                or "lora_As" in name or "lora_Bs" in name
+            ):
                 continue
             param.requires_grad = False
 
@@ -375,14 +438,17 @@ class GenAIClassifier(nn.Module):
                     f"backbone.{k}": v for k, v in state_dict.items()
                 }
 
-        # Remap non-LoRA checkpoint keys to LoRA / ConvLoRA model structure.
+        # Remap non-LoRA checkpoint keys to LoRA / ConvLoRA / LoRA-MoE
+        # model structure.
         # E.g. "blocks.0.attn.qkv.weight" → "blocks.0.attn.qkv.original.weight"
-        if self.lora_enabled or self.convlora_enabled:
+        if self.lora_enabled or self.convlora_enabled or self.lora_moe_enabled:
             from .lora import LoRAConv2d, LoRALinear
+            from .lora_moe import LoRAMoEConv2d, LoRAMoELinear
 
             lora_names = {
                 n for n, m in self.backbone.named_modules()
-                if isinstance(m, (LoRALinear, LoRAConv2d))
+                if isinstance(m, (LoRALinear, LoRAConv2d,
+                                  LoRAMoELinear, LoRAMoEConv2d))
             }
             remapped = {}
             for k, v in state_dict.items():
@@ -433,6 +499,20 @@ class GenAIClassifier(nn.Module):
                     unexpected_keys=[
                         k for k in result.unexpected_keys
                         if not k.startswith("moe_head.")
+                    ]
+                )
+
+        # Load LoRA-MoE temperatures separately (they live outside backbone).
+        if self.lora_moe_enabled:
+            temp_key = "lora_moe_log_temperatures"
+            if temp_key in filtered_state:
+                self.lora_moe_log_temperatures.data.copy_(
+                    filtered_state[temp_key]
+                )
+                result = result._replace(
+                    unexpected_keys=[
+                        k for k in result.unexpected_keys
+                        if k != temp_key
                     ]
                 )
 
@@ -509,6 +589,51 @@ class GenAIClassifier(nn.Module):
                 return logits, features, projection
             return logits
 
+        if self.lora_moe_enabled:
+            from .lora_moe import (
+                clear_lora_moe_state,
+                set_active_expert,
+                set_expert_masks,
+            )
+            from .moe import entropy_weighted_aggregate
+
+            if moe_expert_masks is not None:
+                # === Training: combined delta → single forward ===
+                set_expert_masks(self, moe_expert_masks)
+                features = self._extract_features(x)      # (B, D)
+                logits = self.backbone.head(features)      # (B, C)
+                clear_lora_moe_state(self)
+
+                if return_embedding:
+                    projection = None
+                    if self.projection_head is not None:
+                        projection = self.projection_head(features)
+                    return logits, features, projection
+                return logits
+            else:
+                # === Inference: K forward passes → entropy aggregate ===
+                all_logits = []
+                for k in range(self.lora_moe_num_experts):
+                    set_active_expert(self, k)
+                    feat_k = self._extract_features(x)     # (B, D)
+                    logits_k = self.backbone.head(feat_k)   # (B, C)
+                    all_logits.append(logits_k)
+                clear_lora_moe_state(self)
+
+                stacked = torch.stack(all_logits, dim=1)    # (B, K, C)
+                temperatures = self.lora_moe_log_temperatures.exp()
+                logits = entropy_weighted_aggregate(
+                    stacked, temperatures, self.num_classes,
+                )
+
+                if return_embedding:
+                    features = self._extract_features(x)  # fallback (no LoRA)
+                    projection = None
+                    if self.projection_head is not None:
+                        projection = self.projection_head(features)
+                    return logits, features, projection
+                return logits
+
         if not return_embedding:
             return self.backbone(x)
 
@@ -563,4 +688,12 @@ def build_model(args) -> GenAIClassifier:
         wsgm_aggregation=getattr(args, "wsgm_aggregation", "average"),
         projection_dim=getattr(args, "projection_dim", 0),
         moe_enabled=getattr(args, "moe_enabled", False),
+        lora_moe_enabled=getattr(args, "lora_moe_enabled", False),
+        lora_moe_num_experts=getattr(args, "lora_moe_num_experts", 8),
+        lora_moe_rank=getattr(args, "lora_moe_rank", 8),
+        lora_moe_alpha=getattr(args, "lora_moe_alpha", 8.0),
+        lora_moe_dropout=getattr(args, "lora_moe_dropout", 0.0),
+        lora_moe_convlora_rank=getattr(args, "lora_moe_convlora_rank", 4),
+        lora_moe_convlora_alpha=getattr(args, "lora_moe_convlora_alpha", 4.0),
+        lora_moe_convlora_dropout=getattr(args, "lora_moe_convlora_dropout", 0.0),
     )

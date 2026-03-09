@@ -32,6 +32,52 @@ NUM_EXPERTS = len(EXPERT_GROUPS)
 EXPERT_GROUP_TO_IDX = {name: i for i, name in enumerate(EXPERT_GROUPS)}
 
 
+def entropy_weighted_aggregate(
+    all_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    num_classes: int = 2,
+) -> torch.Tensor:
+    """Entropy-weighted combination of expert logits.
+
+    Args:
+        all_logits: ``(B, K, C)`` raw logits from each expert.
+        temperatures: ``(K,)`` positive per-expert temperature scalars.
+        num_classes: Number of output classes (used for max entropy).
+
+    Returns:
+        ``(B, C)`` aggregated logits.
+    """
+    # Temperature scaling: (1, K, 1) broadcasts over batch and classes.
+    temps = temperatures.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
+    scaled_logits = all_logits / temps  # (B, K, C)
+
+    # Per-expert softmax and entropy.
+    probs = F.softmax(scaled_logits, dim=-1)  # (B, K, C)
+    log_probs = F.log_softmax(scaled_logits, dim=-1)  # (B, K, C)
+    entropy = -(probs * log_probs).sum(dim=-1)  # (B, K)
+
+    # Maximum entropy for C classes.
+    max_entropy = torch.log(
+        torch.tensor(
+            float(num_classes), device=entropy.device,
+            dtype=entropy.dtype,
+        )
+    )
+
+    # Confidence weight: low entropy → high weight.
+    weights = (1.0 - entropy / max_entropy).clamp(min=0.0)  # (B, K)
+
+    # Normalise so weights sum to 1 per sample.
+    weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    weights = weights / weight_sum  # (B, K)
+
+    # Weighted combination of probability distributions.
+    combined_probs = (weights.unsqueeze(-1) * probs).sum(dim=1)  # (B, C)
+
+    # Convert back to logits for compatibility with argmax / softmax.
+    return torch.log(combined_probs.clamp(min=1e-8))
+
+
 class MoEHead(nn.Module):
     """Mixture of Experts classification head.
 
@@ -108,13 +154,8 @@ class MoEHead(nn.Module):
     def inference_aggregate(self, features: torch.Tensor) -> torch.Tensor:
         """Entropy-weighted combination of all expert predictions.
 
-        Steps:
-            1. Get logits from all K experts.
-            2. Apply per-expert temperature scaling.
-            3. Compute softmax probs and entropy per expert per sample.
-            4. Weight = ``(1 - H_k / log C)`` clamped to ``[0, 1]``.
-            5. Normalise weights and compute weighted sum of probs.
-            6. Convert back to log-probs (logit form).
+        Delegates to :func:`entropy_weighted_aggregate` after computing
+        per-expert logits.
 
         Args:
             features: ``(B, D)`` backbone features.
@@ -123,33 +164,6 @@ class MoEHead(nn.Module):
             ``(B, C)`` aggregated logits.
         """
         all_logits = self.forward_all_experts(features)  # (B, K, C)
-
-        # Temperature scaling: (1, K, 1) broadcasts over batch and classes.
-        temps = self.temperatures.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
-        scaled_logits = all_logits / temps  # (B, K, C)
-
-        # Per-expert softmax and entropy.
-        probs = F.softmax(scaled_logits, dim=-1)  # (B, K, C)
-        log_probs = F.log_softmax(scaled_logits, dim=-1)  # (B, K, C)
-        entropy = -(probs * log_probs).sum(dim=-1)  # (B, K)
-
-        # Maximum entropy for C classes.
-        max_entropy = torch.log(
-            torch.tensor(
-                float(self.num_classes), device=entropy.device,
-                dtype=entropy.dtype,
-            )
+        return entropy_weighted_aggregate(
+            all_logits, self.temperatures, self.num_classes,
         )
-
-        # Confidence weight: low entropy → high weight.
-        weights = (1.0 - entropy / max_entropy).clamp(min=0.0)  # (B, K)
-
-        # Normalise so weights sum to 1 per sample.
-        weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        weights = weights / weight_sum  # (B, K)
-
-        # Weighted combination of probability distributions.
-        combined_probs = (weights.unsqueeze(-1) * probs).sum(dim=1)  # (B, C)
-
-        # Convert back to logits for compatibility with argmax / softmax.
-        return torch.log(combined_probs.clamp(min=1e-8))

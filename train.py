@@ -211,12 +211,30 @@ def vram_precheck(
     dummy_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
     criterion_check = nn.CrossEntropyLoss()
 
+    # LoRA-MoE: use single expert for VRAM check to avoid K× forward.
+    # We bypass the classifier's forward (which loops over all experts)
+    # and directly test a single-expert forward pass.
+    _lora_moe_active = False
+    if args is not None and getattr(args, "lora_moe_enabled", False):
+        _lora_moe_active = True
+
     try:
         was_training = model.training
         model.eval()
         with torch.no_grad():
             with autocast(device_type="cuda", enabled=amp):
-                logits = model(dummy_input)
+                if _lora_moe_active:
+                    from models.lora_moe import (
+                        clear_lora_moe_state,
+                        set_active_expert,
+                    )
+                    raw = model.module if hasattr(model, "module") else model
+                    set_active_expert(model, 0)
+                    features = raw._extract_features(dummy_input)
+                    logits = raw.backbone.head(features)
+                    clear_lora_moe_state(model)
+                else:
+                    logits = model(dummy_input)
                 _ = criterion_check(logits, dummy_labels)
         model.train(was_training)
 
@@ -226,6 +244,9 @@ def vram_precheck(
 
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
+        if _lora_moe_active:
+            from models.lora_moe import clear_lora_moe_state
+            clear_lora_moe_state(model)
 
         suggested = None
         for try_bs in [batch_size // 2, batch_size // 4, batch_size // 8]:
@@ -479,6 +500,7 @@ def train_one_epoch(
 
     use_multi_view = getattr(args, "multi_view", False)
     use_moe = getattr(args, "moe_enabled", False)
+    use_lora_moe = getattr(args, "lora_moe_enabled", False)
     use_moe_mv = use_multi_view and use_moe
     sub_loss_meters = {}
     if use_moe_mv:
@@ -715,6 +737,26 @@ def train_one_epoch(
                         avg_logits = (logits * expert_masks.unsqueeze(-1)).sum(dim=1)
                         avg_logits = avg_logits / expert_masks.sum(dim=1, keepdim=True).clamp(min=1)
                     preds = avg_logits.argmax(dim=1)
+                elif use_lora_moe:
+                    from models.moe import EXPERT_GROUP_TO_IDX, NUM_EXPERTS
+
+                    expert_masks = torch.zeros(
+                        batch_size, NUM_EXPERTS,
+                        device=device, dtype=torch.float32,
+                    )
+                    for i, meta in enumerate(_metadata):
+                        groups = meta.get("aug_groups", frozenset({"clean"}))
+                        for g in groups:
+                            idx = EXPERT_GROUP_TO_IDX.get(g)
+                            if idx is not None:
+                                expert_masks[i, idx] = 1.0
+                        if not groups or "clean" in groups:
+                            expert_masks[i, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+                    # LoRA-MoE returns (B, C) — standard CE loss
+                    logits = model(images, moe_expert_masks=expert_masks)
+                    loss = criterion(logits, labels)
+                    preds = logits.argmax(dim=1)
                 else:
                     logits = model(images)
                     loss = criterion(logits, labels)
@@ -958,6 +1000,11 @@ def main():
         args.freeze_backbone = True
         print_rank0("  WSGM enabled: auto-freezing backbone", args)
 
+    # LoRA-MoE implies frozen backbone
+    if getattr(args, "lora_moe_enabled", False) and not args.freeze_backbone:
+        args.freeze_backbone = True
+        print_rank0("  LoRA-MoE enabled: auto-freezing backbone", args)
+
     # Auto-enable projection head when multi_view is on
     if getattr(args, "multi_view", False):
         if getattr(args, "projection_dim", 0) == 0:
@@ -1000,6 +1047,12 @@ def main():
         raw_model = model.module if hasattr(model, "module") else model
         _, _, wsgm_params = count_wsgm_params(raw_model)
         print_rank0(f"  WSGM adapter params: {wsgm_params:,}", args)
+    if getattr(args, "lora_moe_enabled", False):
+        from models.lora_moe import count_lora_moe_params
+
+        raw_model = model.module if hasattr(model, "module") else model
+        _, _, lora_moe_params = count_lora_moe_params(raw_model)
+        print_rank0(f"  LoRA-MoE expert params: {lora_moe_params:,}", args)
 
     # VRAM pre-check (multi-scale: verify largest resolution fits in VRAM)
     if getattr(args, "multiscale", False) and device.type == "cuda":
