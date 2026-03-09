@@ -3,7 +3,6 @@ from typing import Callable
 import torchvision.transforms as T
 
 from .genai_transforms import (
-    CurricularColorJitter,
     CurricularGroupedNOfCompose,
     CurricularNOfCompose,
     CurricularWrapper,
@@ -202,14 +201,15 @@ def _augly_artifact_pool() -> list:
 
 
 def _robust_geometric(image_size: int, crop_p: float = 0.5,
-                      color_jitter=None,
                       small_pad_p: float = 0.0,
                       small_crop_range: tuple = (48, 192)) -> list:
-    """Geometric + color augmentations for robust pipelines.
+    """Geometric augmentations for robust pipelines.
 
-    Same as :func:`_genai_geometric` but with rotation removed entirely
-    to avoid destroying pixel-level artifacts that robust augmentation
-    is designed to preserve.
+    Only spatial transforms (resize/crop, flip) that must always run to
+    produce a correctly-sized output.  Colour perturbation, grayscale,
+    and blur are intentionally omitted — they are covered by the
+    artifact group composition, which honours the ``clean_p``
+    pass-through gate and intensity curriculum scheduling.
 
     When ``small_pad_p > 0``, uses :class:`ResizeOrCropWithSmallPad`
     to randomly simulate very small test images that are reflect-padded
@@ -218,17 +218,10 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
     Args:
         image_size: Target square output size.
         crop_p: Probability of pixel-preserving crop path.
-        color_jitter: Optional replacement for the default
-            ``T.ColorJitter``.  Pass a :class:`CurricularColorJitter`
-            to make colour perturbation curriculum-aware.
         small_pad_p: Probability of small-crop+reflect-pad path
             (0.0 = disabled).
         small_crop_range: ``(min, max)`` pixel range for small crops.
     """
-    if color_jitter is None:
-        color_jitter = T.ColorJitter(
-            brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2,
-        )
     if small_pad_p > 0:
         first_transform = ResizeOrCropWithSmallPad(
             image_size, crop_p=crop_p, scale=(0.5, 1.0),
@@ -241,9 +234,6 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
     return [
         first_transform,
         T.RandomHorizontalFlip(p=0.5),
-        color_jitter,
-        T.RandomGrayscale(p=0.1),
-        T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
     ]
 
 
@@ -314,8 +304,8 @@ def _robust_artifact_groups_extended() -> dict:
             IntensityGaussianBlur(kernel_size=5, sigma=(0.1, 10.0)),
             RandomLensBlur(radius_range=(1, 9), p=1.0),
             RandomMotionBlur(kernel_size_range=(3, 21), p=1.0),
-            RandomMedianBlur(kernel_sizes=(3, 5, 7), p=1.0),
-            RandomBoxBlur(radius_range=(1, 3), p=1.0),
+            RandomMedianBlur(kernel_sizes=(3, 5, 7, 9), p=1.0),
+            RandomBoxBlur(radius_range=(1, 5), p=1.0),
         ],
         "compression": [
             RandomJPEGCompression(quality_range=(10, 95), p=1.0),
@@ -340,7 +330,7 @@ def _robust_artifact_groups_extended() -> dict:
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
-            IntensityRandomPerspective(distortion_scale=0.3),
+            IntensityRandomPerspective(distortion_scale=0.2),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
@@ -447,7 +437,7 @@ def get_train_transform(
             # Clean view: no small-pad simulation (anchor must be stable)
             geo_list = [
                 t for t in geo_fn(image_size, small_pad_p=0.0)
-                if not isinstance(t, (T.ColorJitter, CurricularColorJitter))
+                if not isinstance(t, T.ColorJitter)
             ]
             return T.Compose(geo_list + _to_tensor_normalize())
         # For other types (none, default, strong) fall through — they
@@ -585,13 +575,6 @@ def get_train_transform(
         if epoch_state is None:
             import multiprocessing
             epoch_state = multiprocessing.Value("i", 0)
-        curricular_cj = CurricularColorJitter(
-            brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1,
-            epoch_state=epoch_state,
-            total_epochs=total_epochs,
-            curriculum_ratio=curriculum_ratio,
-            min_scale=0.2,
-        )
         artifact_compose = CurricularGroupedNOfCompose(
             _robust_artifact_groups_extended(),
             epoch_state=epoch_state,
@@ -602,11 +585,11 @@ def get_train_transform(
             curriculum_ratio=curriculum_ratio,
             weights=_ROBUST_GROUP_WEIGHTS,
             clean_p_start=0.5,
-            clean_p_end=0.1,
+            clean_p_end=0.15,
             intensity_curriculum=True,
         )
         return T.Compose(
-            _robust_geometric(image_size, color_jitter=curricular_cj,
+            _robust_geometric(image_size,
                               small_pad_p=small_pad_p,
                               small_crop_range=small_crop_range)
             + [artifact_compose]
