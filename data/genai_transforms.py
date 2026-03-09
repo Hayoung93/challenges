@@ -366,6 +366,11 @@ class RandomSmallCropReflectPad:
         multiple rounds, each time padding by at most ``dim - 1`` pixels.
         """
         w, h = img.size
+        # 1px dimension: reflect-pad needs pad < dim, so pad=0 → infinite
+        # loop.  Upscale to 2px with NEAREST (preserves pixel value) first.
+        if w < 2 or h < 2:
+            img = img.resize((max(w, 2), max(h, 2)), Image.NEAREST)
+            w, h = img.size
         while w < target_size or h < target_size:
             pad_w = min(w - 1, max(0, target_size - w))
             pad_h = min(h - 1, max(0, target_size - h))
