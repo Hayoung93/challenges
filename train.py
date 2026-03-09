@@ -280,8 +280,14 @@ def _log_training_images(
 
 @torch.no_grad()
 def ema_update(student: nn.Module, teacher: nn.Module, decay: float) -> None:
-    """Update teacher parameters as EMA of student parameters."""
-    student_params = dict(student.named_parameters())
+    """Update teacher parameters as EMA of student parameters.
+
+    Automatically unwraps DDP / DataParallel wrappers so that parameter
+    names match between the (possibly wrapped) student and the
+    (unwrapped) teacher.
+    """
+    student_raw = student.module if hasattr(student, "module") else student
+    student_params = dict(student_raw.named_parameters())
     for name, teacher_param in teacher.named_parameters():
         if name in student_params:
             teacher_param.data.mul_(decay).add_(student_params[name].data, alpha=1.0 - decay)
@@ -896,9 +902,11 @@ def main():
         )
 
     # EMA teacher model for teacher-student MVC
+    # Build from the unwrapped model to avoid deep-copying DDP/DP internals.
     ema_teacher = None
     if getattr(args, "mvc_ema", False) and getattr(args, "multi_view", False):
-        ema_teacher = build_ema_teacher(model)
+        raw_model = model.module if hasattr(model, "module") else model
+        ema_teacher = build_ema_teacher(raw_model)
         ema_teacher.eval()
         # Load EMA teacher state from checkpoint if resuming
         if ckpt is not None and "ema_teacher" in ckpt:
