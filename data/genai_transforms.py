@@ -1791,10 +1791,12 @@ class GroupedNOfCompose:
     def __call__(self, img: Image.Image) -> Image.Image:
         if self.clean_p > 0.0 and random.random() < self.clean_p:
             self._last_clean = True
+            self._last_groups = frozenset({"clean"})
             return img
         self._last_clean = False
         n_upper = min(self.n, len(self.group_names))
         if n_upper <= 0:
+            self._last_groups = frozenset({"clean"})
             return img
         k = random.randint(1, n_upper)
         if self._weights is not None:
@@ -1803,6 +1805,7 @@ class GroupedNOfCompose:
             )
         else:
             selected_groups = random.sample(self.group_names, k)
+        self._last_groups = frozenset(selected_groups)
         transforms = []
         for group_name in selected_groups:
             t = random.choice(self.groups[group_name])
@@ -1948,10 +1951,12 @@ class CurricularGroupedNOfCompose:
         clean_p = self._get_clean_p()
         if clean_p > 0.0 and random.random() < clean_p:
             self._last_clean = True
+            self._last_groups = frozenset({"clean"})
             return img
         self._last_clean = False
         n_upper = min(self._get_n_upper(), len(self.group_names))
         if n_upper <= 0:
+            self._last_groups = frozenset({"clean"})
             return img
         n_lower = 1 if self._legacy else self.n_min
         n_lower = min(n_lower, n_upper)
@@ -1962,6 +1967,7 @@ class CurricularGroupedNOfCompose:
             )
         else:
             selected_groups = random.sample(self.group_names, k)
+        self._last_groups = frozenset(selected_groups)
         transforms = []
         for group_name in selected_groups:
             t = random.choice(self.groups[group_name])

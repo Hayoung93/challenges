@@ -74,6 +74,8 @@ class NTIREDataset(BaseGenAIDataset):
     def __getitem__(self, index: int) -> Tuple[Any, int, Dict[str, Any]]:
         image, label, metadata = self._load_image_and_label(index)
         image = self._apply_transform(image)
+        if hasattr(self.transform, "last_groups"):
+            metadata["aug_groups"] = self.transform.last_groups
         return image, label, metadata
 
 

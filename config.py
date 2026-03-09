@@ -84,6 +84,9 @@ DEFAULTS = {
     "wsgm_dropout": 0.5,
     "wsgm_aggregation": "average",  # "average" or "concat"
 
+    # Mixture of Experts
+    "moe_enabled": False,
+
     # Training hyperparameters
     "lr": 1e-4,
     "weight_decay": 0.05,
@@ -311,6 +314,12 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["wsgm_aggregation"],
                     choices=["average", "concat"],
                     help="WSGM output aggregation mode")
+    g.add_argument("--moe_enabled", action="store_true",
+                    default=DEFAULTS["moe_enabled"],
+                    help="Enable Mixture of Experts classification heads "
+                         "(requires robust augmentation mode)")
+    g.add_argument("--no_moe_enabled", dest="moe_enabled",
+                    action="store_false")
     return parser
 
 
@@ -523,5 +532,19 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
     # Ensure TTA prep tensors are large enough for crop-based TTA views.
     if args.tta_min_prep_size < args.image_size + 128:
         args.tta_min_prep_size = args.image_size + 128
+
+    # MoE requires grouped augmentation (robust variants).
+    if getattr(args, "moe_enabled", False):
+        aug = getattr(args, "augmentation", "default")
+        if aug not in ("robust", "robust_curriculum", "robust_curriculum_range"):
+            raise ValueError(
+                f"--moe_enabled requires --augmentation robust/robust_curriculum/"
+                f"robust_curriculum_range, got '{aug}'"
+            )
+        if getattr(args, "multi_view", False):
+            raise ValueError(
+                "--moe_enabled and --multi_view are mutually exclusive. "
+                "MoE training requires single-view mode with expert-routed loss."
+            )
 
     return args

@@ -44,6 +44,49 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+class TrackingTransformWrapper:
+    """Wraps a transform pipeline and captures augmentation group metadata.
+
+    After each ``__call__``, the :attr:`last_groups` attribute holds a
+    ``frozenset`` of group names that were applied (e.g.
+    ``frozenset({"blur", "noise"})``).  When no group-based augmentation
+    is in use, ``last_groups`` defaults to ``frozenset({"clean"})``.
+
+    Thread-safe in multi-worker DataLoaders because each worker gets its
+    own copy of the dataset (and hence its own wrapper instance), and
+    ``last_groups`` is written and read within the same ``__getitem__``.
+
+    Args:
+        pipeline: The full torchvision ``Compose`` transform pipeline.
+        group_source: The ``GroupedNOfCompose`` or
+            ``CurricularGroupedNOfCompose`` instance inside the pipeline
+            that sets ``_last_groups``.  When ``None``, every call reports
+            ``frozenset({"clean"})``.
+    """
+
+    def __init__(self, pipeline, group_source=None):
+        self.pipeline = pipeline
+        self.group_source = group_source
+        self.last_groups: frozenset = frozenset({"clean"})
+
+    def __call__(self, img):
+        result = self.pipeline(img)
+        if self.group_source is not None:
+            self.last_groups = getattr(
+                self.group_source, "_last_groups", frozenset({"clean"}),
+            )
+        else:
+            self.last_groups = frozenset({"clean"})
+        return result
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"pipeline={self.pipeline}, "
+            f"group_source={self.group_source})"
+        )
+
+
 class ResizeIfSmaller:
     """Resize the image only if its shortest edge is smaller than *min_size*.
 
@@ -373,6 +416,7 @@ def get_train_transform(
     clean_view: bool = False,
     small_pad_p: float = 0.0,
     small_crop_range: tuple = (48, 192),
+    moe_tracking: bool = False,
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -400,6 +444,9 @@ def get_train_transform(
         small_pad_p: Probability of small-crop+reflect-pad augmentation
             (0.0 = disabled).  Simulates very small test images.
         small_crop_range: ``(min, max)`` pixel range for small crops.
+        moe_tracking: When ``True``, wraps the returned pipeline in a
+            :class:`TrackingTransformWrapper` that captures which
+            augmentation groups were applied (for MoE training).
     """
     # Multi-scale: wrap with dynamic resolution dispatch
     if scale_state is not None:
@@ -417,6 +464,7 @@ def get_train_transform(
                 clean_view=clean_view,
                 small_pad_p=small_pad_p,
                 small_crop_range=small_crop_range,
+                moe_tracking=moe_tracking,
             )
         return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
 
@@ -542,7 +590,7 @@ def get_train_transform(
             _robust_artifact_groups(), n=4,
             weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
         )
-        return T.Compose(
+        pipeline = T.Compose(
             _robust_geometric(image_size, small_pad_p=small_pad_p,
                               small_crop_range=small_crop_range)
             + [artifact_compose]
@@ -550,6 +598,9 @@ def get_train_transform(
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
+        if moe_tracking:
+            return TrackingTransformWrapper(pipeline, group_source=artifact_compose)
+        return pipeline
     elif augmentation == "robust_curriculum":
         if epoch_state is None:
             import multiprocessing
@@ -566,7 +617,7 @@ def get_train_transform(
             clean_p_start=0.5,
             clean_p_end=0.1,
         )
-        return T.Compose(
+        pipeline = T.Compose(
             _robust_geometric(image_size, small_pad_p=small_pad_p,
                               small_crop_range=small_crop_range)
             + [artifact_compose]
@@ -574,6 +625,9 @@ def get_train_transform(
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
+        if moe_tracking:
+            return TrackingTransformWrapper(pipeline, group_source=artifact_compose)
+        return pipeline
     elif augmentation == "robust_curriculum_range":
         if epoch_state is None:
             import multiprocessing
@@ -591,7 +645,7 @@ def get_train_transform(
             clean_p_end=0.15,
             intensity_curriculum=True,
         )
-        return T.Compose(
+        pipeline = T.Compose(
             _robust_geometric(image_size,
                               small_pad_p=small_pad_p,
                               small_crop_range=small_crop_range)
@@ -600,6 +654,9 @@ def get_train_transform(
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
             + _to_tensor_normalize()
         )
+        if moe_tracking:
+            return TrackingTransformWrapper(pipeline, group_source=artifact_compose)
+        return pipeline
     else:
         raise ValueError(f"Unknown augmentation: {augmentation}")
 

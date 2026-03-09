@@ -75,4 +75,6 @@ class MultiViewDataset(Dataset):
         image, label, metadata = self.dataset._load_image_and_label(index)
         view1 = self.transform1(image)
         view2 = self.transform2(image)
+        if hasattr(self.transform1, "last_groups"):
+            metadata["aug_groups"] = self.transform1.last_groups
         return view1, view2, label, metadata

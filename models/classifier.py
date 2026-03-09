@@ -169,6 +169,9 @@ class GenAIClassifier(nn.Module):
         wsgm_reduction_factor: WSGM bottleneck = embed_dim // factor.
         wsgm_dropout: Dropout probability in WSGM modules.
         wsgm_aggregation: ``"average"`` or ``"concat"``.
+        moe_enabled: Replace the single classification head with a
+            :class:`~models.moe.MoEHead` (8 expert heads).  Mutually
+            exclusive with ``wsgm``.
     """
 
     def __init__(
@@ -195,6 +198,7 @@ class GenAIClassifier(nn.Module):
         wsgm_dropout: float = 0.5,
         wsgm_aggregation: str = "average",
         projection_dim: int = 0,
+        moe_enabled: bool = False,
     ):
         super().__init__()
         if model_name not in VALID_MODELS:
@@ -214,6 +218,8 @@ class GenAIClassifier(nn.Module):
             raise ValueError("--wsgm and --lora_enabled are mutually exclusive")
         if wsgm and convlora_enabled:
             raise ValueError("--wsgm and --convlora_enabled are mutually exclusive")
+        if moe_enabled and wsgm:
+            raise ValueError("--moe_enabled and --wsgm are mutually exclusive")
 
         if model_name in _DINOV3_WEIGHTS:
             # --- DINOv3 backbone ---
@@ -243,6 +249,7 @@ class GenAIClassifier(nn.Module):
         self.lora_enabled = lora_enabled
         self.convlora_enabled = convlora_enabled
         self.wsgm_enabled = wsgm
+        self.moe_enabled = moe_enabled
 
         if wsgm:
             if model_name not in _DINOV3_WEIGHTS:
@@ -260,9 +267,15 @@ class GenAIClassifier(nn.Module):
             )
         else:
             # Replace the classification head for our target num_classes.
-            self.backbone.head = nn.Linear(num_features, num_classes)
-            trunc_normal_(self.backbone.head.weight, std=0.02)
-            nn.init.zeros_(self.backbone.head.bias)
+            if moe_enabled:
+                from .moe import MoEHead
+
+                self.backbone.head = nn.Identity()
+                self.moe_head = MoEHead(num_features, num_classes)
+            else:
+                self.backbone.head = nn.Linear(num_features, num_classes)
+                trunc_normal_(self.backbone.head.weight, std=0.02)
+                nn.init.zeros_(self.backbone.head.bias)
 
             # LoRA — must be applied before freeze and checkpoint load.
             if lora_enabled:
@@ -407,6 +420,22 @@ class GenAIClassifier(nn.Module):
 
         result = self.backbone.load_state_dict(filtered_state, strict=False)
 
+        # Load MoE head parameters separately (they live outside backbone).
+        if self.moe_enabled:
+            moe_state = {
+                k.removeprefix("moe_head."): v
+                for k, v in filtered_state.items()
+                if k.startswith("moe_head.")
+            }
+            if moe_state:
+                self.moe_head.load_state_dict(moe_state, strict=False)
+                result = result._replace(
+                    unexpected_keys=[
+                        k for k in result.unexpected_keys
+                        if not k.startswith("moe_head.")
+                    ]
+                )
+
         if result.missing_keys:
             logger.warning(
                 "Checkpoint missing keys (kept at init values):\n  %s",
@@ -418,8 +447,19 @@ class GenAIClassifier(nn.Module):
                 "\n  ".join(result.unexpected_keys),
             )
 
+    def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract backbone features without the classification head."""
+        if self.model_name in _DINOV3_WEIGHTS:
+            ret = self.backbone.forward_features(x)
+            return ret["x_norm_clstoken"]
+        else:  # MambaVision
+            return self.backbone.forward_features(x)
+
     def forward(
-        self, x: torch.Tensor, return_embedding: bool = False,
+        self,
+        x: torch.Tensor,
+        return_embedding: bool = False,
+        moe_expert_masks: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple:
         """Forward pass.
 
@@ -427,12 +467,32 @@ class GenAIClassifier(nn.Module):
             x: Input tensor of shape ``(B, 3, H, W)``.
             return_embedding: If True, also return the embedding and
                 optional projection.
+            moe_expert_masks: ``(B, K)`` binary mask indicating which
+                experts are active per sample (training only).  When
+                ``None`` and MoE is enabled, uses entropy-weighted
+                aggregation (inference mode).
 
         Returns:
-            Logits ``(B, num_classes)`` when ``return_embedding=False``.
+            Logits ``(B, num_classes)`` when ``return_embedding=False``
+            and MoE is disabled or in inference mode.
+            Logits ``(B, K, num_classes)`` when MoE training with masks.
             ``(logits, embedding, projection)`` when ``return_embedding=True``,
             where *projection* is ``None`` if no projection head is configured.
         """
+        if self.moe_enabled:
+            features = self._extract_features(x)
+            if moe_expert_masks is not None:
+                logits = self.moe_head.forward_routed(features, moe_expert_masks)
+            else:
+                logits = self.moe_head.inference_aggregate(features)
+
+            if return_embedding:
+                projection = None
+                if self.projection_head is not None:
+                    projection = self.projection_head(features)
+                return logits, features, projection
+            return logits
+
         if not return_embedding:
             return self.backbone(x)
 
@@ -486,4 +546,5 @@ def build_model(args) -> GenAIClassifier:
         wsgm_dropout=getattr(args, "wsgm_dropout", 0.5),
         wsgm_aggregation=getattr(args, "wsgm_aggregation", "average"),
         projection_dim=getattr(args, "projection_dim", 0),
+        moe_enabled=getattr(args, "moe_enabled", False),
     )

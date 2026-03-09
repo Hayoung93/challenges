@@ -470,6 +470,7 @@ def train_one_epoch(
     acc_meter = AverageMeter()
 
     use_multi_view = getattr(args, "multi_view", False)
+    use_moe = getattr(args, "moe_enabled", False)
     sub_loss_meters = {}
     if use_multi_view:
         sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
@@ -584,10 +585,34 @@ def train_one_epoch(
                 )
 
             with autocast(device_type="cuda", enabled=args.amp):
-                logits = model(images)
-                loss = criterion(logits, labels)
+                if use_moe:
+                    from models.moe import EXPERT_GROUP_TO_IDX, NUM_EXPERTS
 
-            preds = logits.argmax(dim=1)
+                    expert_masks = torch.zeros(
+                        batch_size, NUM_EXPERTS,
+                        device=device, dtype=torch.float32,
+                    )
+                    for i, meta in enumerate(_metadata):
+                        groups = meta.get("aug_groups", frozenset({"clean"}))
+                        for g in groups:
+                            idx = EXPERT_GROUP_TO_IDX.get(g)
+                            if idx is not None:
+                                expert_masks[i, idx] = 1.0
+                        if not groups or "clean" in groups:
+                            expert_masks[i, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+                    logits = model(images, moe_expert_masks=expert_masks)
+                    loss = criterion(logits, labels, expert_masks)
+
+                    # Accuracy: aggregate from already-computed expert logits
+                    with torch.no_grad():
+                        avg_logits = (logits * expert_masks.unsqueeze(-1)).sum(dim=1)
+                        avg_logits = avg_logits / expert_masks.sum(dim=1, keepdim=True).clamp(min=1)
+                    preds = avg_logits.argmax(dim=1)
+                else:
+                    logits = model(images)
+                    loss = criterion(logits, labels)
+                    preds = logits.argmax(dim=1)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()

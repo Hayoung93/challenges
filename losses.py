@@ -362,6 +362,62 @@ class MultiViewCriterion(nn.Module):
         return total, components
 
 
+class MoECriterion(nn.Module):
+    """Loss for Mixture of Experts training.
+
+    Routes the classification loss to the expert heads whose augmentation
+    groups were active for each sample.
+
+    For each active expert *k*, CE loss is computed on the subset of
+    samples where that expert's augmentation group was applied.
+    The final loss averages over all active experts.
+
+    Args:
+        base_criterion: Underlying per-sample loss (CrossEntropyLoss,
+            FocalLoss, etc.).
+        num_experts: Number of expert heads (default 8).
+    """
+
+    def __init__(self, base_criterion: nn.Module, num_experts: int = 8):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.num_experts = num_experts
+
+    def forward(
+        self,
+        all_logits: torch.Tensor,
+        labels: torch.Tensor,
+        expert_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute expert-routed loss.
+
+        Args:
+            all_logits: ``(B, K, C)`` logits from all expert heads.
+            labels: ``(B,)`` ground-truth class indices.
+            expert_masks: ``(B, K)`` binary mask — 1 if expert *k* is
+                active for sample *i*.
+
+        Returns:
+            Scalar loss (mean across active experts).
+        """
+        total_loss = torch.tensor(
+            0.0, device=all_logits.device, dtype=all_logits.dtype,
+        )
+        count = 0
+
+        for k in range(self.num_experts):
+            mask = expert_masks[:, k].bool()
+            if not mask.any():
+                continue
+            loss_k = self.base_criterion(all_logits[mask, k, :], labels[mask])
+            total_loss = total_loss + loss_k
+            count += 1
+
+        if count == 0:
+            return total_loss.requires_grad_()
+        return total_loss / count
+
+
 def build_criterion(args) -> nn.Module:
     """Build the training loss criterion from config flags.
 
@@ -371,6 +427,7 @@ def build_criterion(args) -> nn.Module:
     * ``FocalLoss`` — ``focal_gamma > 0`` only
     * ``HardSampleMiningLoss(CrossEntropyLoss)`` — ``ohsm_enabled``, ``focal_gamma=0``
     * ``HardSampleMiningLoss(FocalLoss)`` — both enabled
+    * ``MoECriterion(base_loss)`` — ``moe_enabled=True``
     """
     label_smoothing = getattr(args, "label_smoothing", 0.1)
     focal_gamma = getattr(args, "focal_gamma", 0.0)
@@ -388,10 +445,15 @@ def build_criterion(args) -> nn.Module:
         base_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     if ohsm_enabled and ohsm_keep_ratio < 1.0:
-        return HardSampleMiningLoss(
+        base_loss = HardSampleMiningLoss(
             base_loss=base_loss,
             keep_ratio=ohsm_keep_ratio,
             min_keep=ohsm_min_keep,
         )
+
+    if getattr(args, "moe_enabled", False):
+        from models.moe import NUM_EXPERTS
+
+        return MoECriterion(base_loss, num_experts=NUM_EXPERTS)
 
     return base_loss

@@ -182,6 +182,7 @@ _CRITICAL_KEYS = [
     ("lora_enabled",     "LoRA enabled"),
     ("convlora_enabled", "ConvLoRA enabled"),
     ("wsgm",             "WSGM enabled"),
+    ("moe_enabled",      "MoE enabled"),
 ]
 
 # Keys that affect inference quality — mismatch may degrade results.

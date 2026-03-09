@@ -76,6 +76,7 @@ def build_dataset(name: str, args, split: str = "train",
                 getattr(args, "small_crop_range_min", 48),
                 getattr(args, "small_crop_range_max", 192),
             ),
+            moe_tracking=getattr(args, "moe_enabled", False),
         )
     else:
         transform = _get_inference_transform(args)
