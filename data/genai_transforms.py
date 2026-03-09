@@ -10,12 +10,19 @@ import io
 import math
 import random
 
+import cv2
 import numpy as np
 import scipy.ndimage
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageEnhance, ImageFilter
 from scipy.interpolate import PchipInterpolator
+
+try:
+    import pillow_avif  # noqa: F401
+    _AVIF_AVAILABLE = True
+except ImportError:
+    _AVIF_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -88,22 +95,38 @@ class RandomJPEGCompression:
         )
 
 
+_INTERPOLATION_METHODS = [
+    Image.NEAREST,
+    Image.BILINEAR,
+    Image.BICUBIC,
+    Image.LANCZOS,
+]
+
+
 class RandomDownscaleUpscale:
     """Downscale then upscale to introduce resize / interpolation artifacts.
 
     Simulates resolution changes from web sharing, screenshots, or
     thumbnail generation.  The round-trip destroys high-frequency detail
-    and introduces characteristic aliasing patterns.
+    and introduces characteristic aliasing patterns.  Interpolation
+    methods are randomly selected per call to cover the diversity of
+    resampling algorithms used across platforms.
 
     Args:
         scale_range: ``(min_scale, max_scale)`` relative to original size.
         p: Probability of applying this transform.
+        interpolation_methods: List of PIL resampling filters to randomly
+            choose from.  Defaults to NEAREST, BILINEAR, BICUBIC, LANCZOS.
     """
 
-    def __init__(self, scale_range=(0.5, 0.9), p=0.3):
+    def __init__(self, scale_range=(0.5, 0.9), p=0.3,
+                 interpolation_methods=None):
         self.scale_range = scale_range
         self.p = p
         self._intensity = 1.0
+        self.interpolation_methods = (
+            interpolation_methods or _INTERPOLATION_METHODS
+        )
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
@@ -112,8 +135,10 @@ class RandomDownscaleUpscale:
         lo, hi = _iscale_lower(self.scale_range, self._intensity)
         scale = random.uniform(lo, hi)
         new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-        down = img.resize((new_w, new_h), Image.BILINEAR)
-        up = down.resize((w, h), Image.BILINEAR)
+        method_down = random.choice(self.interpolation_methods)
+        method_up = random.choice(self.interpolation_methods)
+        down = img.resize((new_w, new_h), method_down)
+        up = down.resize((w, h), method_up)
         return up
 
     def __repr__(self):
@@ -161,15 +186,17 @@ class RandomSaltPepperNoise:
     """Add salt-and-pepper (impulse) noise to a PIL image.
 
     Randomly replaces a fraction of pixels with pure white (salt, 255)
-    or pure black (pepper, 0).
+    or pure black (pepper, 0).  The corruption amount is sampled
+    uniformly from *amount_range* and scaled by ``_intensity``.
 
     Args:
-        amount: Fraction of pixels to corrupt (0.0--1.0).
+        amount_range: ``(min_amount, max_amount)`` fraction of pixels
+            to corrupt (0.0--1.0).
         p: Probability of applying this transform.
     """
 
-    def __init__(self, amount=0.05, p=0.05):
-        self.amount = amount
+    def __init__(self, amount_range=(0.01, 0.08), p=0.05):
+        self.amount_range = amount_range
         self.p = p
         self._intensity = 1.0
 
@@ -178,16 +205,17 @@ class RandomSaltPepperNoise:
             return img
         arr = np.array(img)
         h, w = arr.shape[:2]
-        effective_amount = self.amount * self._intensity
+        lo, hi = _iscale_upper(self.amount_range, self._intensity)
+        amount = random.uniform(lo, hi)
         mask = np.random.random((h, w))
-        arr[mask < effective_amount / 2] = 255       # salt
-        arr[mask > 1 - effective_amount / 2] = 0     # pepper
+        arr[mask < amount / 2] = 255       # salt
+        arr[mask > 1 - amount / 2] = 0     # pepper
         return Image.fromarray(arr)
 
     def __repr__(self):
         return (
             f"{self.__class__.__name__}("
-            f"amount={self.amount}, p={self.p})"
+            f"amount_range={self.amount_range}, p={self.p})"
         )
 
 
@@ -196,15 +224,17 @@ class RandomImpulseNoise:
 
     Unlike salt-and-pepper noise which sets entire pixels to black or
     white, impulse noise corrupts each RGB channel independently,
-    producing colourful speckles.
+    producing colourful speckles.  The corruption amount is sampled
+    uniformly from *amount_range* and scaled by ``_intensity``.
 
     Args:
-        amount: Fraction of channel values to corrupt (0.0--1.0).
+        amount_range: ``(min_amount, max_amount)`` fraction of channel
+            values to corrupt (0.0--1.0).
         p: Probability of applying this transform.
     """
 
-    def __init__(self, amount=0.05, p=0.03):
-        self.amount = amount
+    def __init__(self, amount_range=(0.01, 0.08), p=0.03):
+        self.amount_range = amount_range
         self.p = p
         self._intensity = 1.0
 
@@ -212,16 +242,17 @@ class RandomImpulseNoise:
         if random.random() > self.p:
             return img
         arr = np.array(img)
-        effective_amount = self.amount * self._intensity
+        lo, hi = _iscale_upper(self.amount_range, self._intensity)
+        amount = random.uniform(lo, hi)
         mask = np.random.random(arr.shape)
-        arr[mask < effective_amount / 2] = 255
-        arr[mask > 1 - effective_amount / 2] = 0
+        arr[mask < amount / 2] = 255
+        arr[mask > 1 - amount / 2] = 0
         return Image.fromarray(arr)
 
     def __repr__(self):
         return (
             f"{self.__class__.__name__}("
-            f"amount={self.amount}, p={self.p})"
+            f"amount_range={self.amount_range}, p={self.p})"
         )
 
 
@@ -747,6 +778,8 @@ class CurricularNOfCompose:
         if self.total_epochs <= 1:
             return self.n_max
         curriculum_epochs = max(self.total_epochs * self.curriculum_ratio, 1)
+        if curriculum_epochs <= 1:
+            return self.n_max
         progress = self.epoch_state.value / (curriculum_epochs - 1)
         progress = min(max(progress, 0.0), 1.0)
         return max(self.n_min, round(self.n_min + (self.n_max - self.n_min) * progress))
@@ -1048,6 +1081,45 @@ class RandomWebPCompression:
         return (
             f"{self.__class__.__name__}("
             f"quality_range={self.quality_range}, p={self.p})"
+        )
+
+
+class RandomAVIFCompression:
+    """Randomly compress image via AVIF at a random quality level.
+
+    AVIF uses AV1 intra-frame coding, producing different compression
+    artifacts from JPEG (8x8 DCT) and WebP (4x4 transform).  Training
+    on AVIF helps the model generalize as modern browsers and operating
+    systems increasingly adopt AVIF as a default format.
+
+    Requires ``pillow-avif-plugin``.  When the plugin is unavailable
+    the transform passes through without modification.
+
+    Args:
+        quality_range: ``(min_quality, max_quality)``, integers in 1--100.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, quality_range=(10, 95), p=0.3):
+        self.quality_range = quality_range
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p or not _AVIF_AVAILABLE:
+            return img
+        lo, hi = _iscale_lower(self.quality_range, self._intensity)
+        quality = random.randint(int(round(lo)), int(round(hi)))
+        buffer = io.BytesIO()
+        img.save(buffer, format="AVIF", quality=quality)
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"quality_range={self.quality_range}, p={self.p}, "
+            f"avif_available={_AVIF_AVAILABLE})"
         )
 
 
@@ -1460,7 +1532,7 @@ class RandomMoire:
     When triggered (probability *p*), the transform selects **one** of two
     strategies controlled by ``sine_ratio``:
 
-    * **Sine-wave mode** (default 70%): generates 2–3 overlapping sine waves
+    * **Sine-wave mode** (default 70%): generates 2–4 overlapping sine waves
       at random frequencies and angles, producing a procedural interference
       pattern that is alpha-blended onto the image.
     * **Bank-blend mode** (default 30%): loads a random moire pattern from a
@@ -1504,6 +1576,7 @@ class RandomMoire:
         self.sine_opacity_range = sine_opacity_range
         self.bank_opacity_range = bank_opacity_range
         self.p = p
+        self._intensity = 1.0
 
         # Load bank images as compressed bytes for memory efficiency.
         self._bank_bytes: list[bytes] = []
@@ -1576,7 +1649,8 @@ class RandomMoire:
         else:
             moire_rgb = pattern[:, :, None] * 255.0
 
-        opacity = random.uniform(*self.sine_opacity_range)
+        lo, hi = _iscale_upper(self.sine_opacity_range, self._intensity)
+        opacity = random.uniform(lo, hi)
         blended = arr * (1 - opacity) + moire_rgb * opacity
 
         return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8))
@@ -1612,7 +1686,8 @@ class RandomMoire:
         arr = np.array(img, dtype=np.float32)
         h, w = arr.shape[:2]
         pat = self._load_random_pattern(w, h)
-        opacity = random.uniform(*self.bank_opacity_range)
+        lo, hi = _iscale_upper(self.bank_opacity_range, self._intensity)
+        opacity = random.uniform(lo, hi)
 
         mode = random.choice(["multiply", "alpha", "overlay"])
 
@@ -2112,7 +2187,16 @@ class SkipIfClean:
     def __call__(self, img):
         if getattr(self.source, "_last_clean", False):
             return img
-        return self.transform(img)
+        # Propagate intensity from curriculum source.
+        progress = None
+        if (hasattr(self.transform, "_intensity")
+                and getattr(self.source, "intensity_curriculum", False)):
+            progress = self.source._get_progress()
+            self.transform._intensity = progress
+        result = self.transform(img)
+        if progress is not None:
+            self.transform._intensity = 1.0  # reset
+        return result
 
     def __repr__(self):
         return (
