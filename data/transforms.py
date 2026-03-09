@@ -175,6 +175,38 @@ class MultiscaleTransformWrapper:
         )
 
 
+class _MultiscaleMultiViewWrapper:
+    """Wrap multi-view transform factory to read target size from shared state.
+
+    Parallels :class:`MultiscaleTransformWrapper` but returns a 3-tuple
+    ``(shared_spatial, augment_only, to_tensor_norm)`` instead of a
+    single callable.  Use :meth:`get_transforms` to obtain the tuple
+    for the current resolution.
+
+    Args:
+        build_fn: Callable ``(image_size) -> (spatial, augment, norm)``
+            that builds the split transforms for a given resolution.
+        scale_state: ``multiprocessing.Value('i', ...)`` holding the
+            current target resolution.
+        default_size: Fallback size when ``scale_state`` is not set.
+    """
+
+    def __init__(self, build_fn, scale_state, default_size: int = 224):
+        self.build_fn = build_fn
+        self.scale_state = scale_state
+        self.default_size = default_size
+        self._cache = {}
+
+    def get_transforms(self):
+        """Return ``(shared_spatial, augment_only, to_tensor_norm)``."""
+        size = (self.scale_state.value
+                if self.scale_state is not None
+                else self.default_size)
+        if size not in self._cache:
+            self._cache[size] = self.build_fn(size)
+        return self._cache[size]
+
+
 def _strong_geometric(image_size: int) -> list:
     """Shared geometric + color augmentations for strong / genai pipelines."""
     return [
@@ -214,6 +246,47 @@ def _genai_geometric(image_size: int, crop_p: float = 0.5,
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
         T.RandomRotation(degrees=15),
+        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+        T.RandomGrayscale(p=0.1),
+        T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+    ]
+
+
+def _genai_spatial(image_size: int, crop_p: float = 0.5,
+                   small_pad_p: float = 0.0,
+                   small_crop_range: tuple = (48, 192)) -> list:
+    """Spatial-only subset of :func:`_genai_geometric`.
+
+    Returns crop, flip, and rotation transforms without any appearance
+    transforms (ColorJitter, RandomGrayscale, GaussianBlur).  Used by
+    :func:`get_multi_view_transforms` to build the shared spatial stage
+    that is applied once and shared between both views.
+    """
+    if small_pad_p > 0:
+        first_transform = ResizeOrCropWithSmallPad(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+            small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+        )
+    else:
+        first_transform = RandomResizeOrCrop(
+            image_size, crop_p=crop_p, scale=(0.5, 1.0),
+        )
+    return [
+        first_transform,
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.1),
+        T.RandomRotation(degrees=15),
+    ]
+
+
+def _genai_appearance() -> list:
+    """Appearance transforms extracted from :func:`_genai_geometric`.
+
+    These are non-spatial transforms (color perturbation, grayscale,
+    blur) that should only be applied to the augmented view in
+    multi-view training.
+    """
+    return [
         T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
         T.RandomGrayscale(p=0.1),
         T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
@@ -659,6 +732,253 @@ def get_train_transform(
         return pipeline
     else:
         raise ValueError(f"Unknown augmentation: {augmentation}")
+
+
+def get_multi_view_transforms(
+    image_size: int = 224,
+    augmentation: str = "default",
+    total_epochs: int = 30,
+    epoch_state=None,
+    curriculum_ratio: float = 0.5,
+    curriculum_n_min: int = 2,
+    curriculum_n_max_start: int = 3,
+    curriculum_n_max_end: int = 7,
+    scale_state=None,
+    small_pad_p: float = 0.0,
+    small_crop_range: tuple = (48, 192),
+    moe_tracking: bool = False,
+) -> tuple:
+    """Build split transforms for multi-view consistency training.
+
+    Instead of two independent composed transforms (which produce
+    different crop regions), this returns three stages:
+
+    1. **shared_spatial** — crop, flip, rotation (applied once, shared
+       by both views so they see the same spatial content).
+    2. **augment_only** — appearance transforms (ColorJitter, Grayscale,
+       GaussianBlur) plus artifact transforms (compression, noise, etc.).
+       Applied only to view 1.
+    3. **to_tensor_norm** — ``ToTensor`` + ``Normalize``.  Applied to
+       both views independently.
+
+    Args:
+        image_size: Target crop size.
+        augmentation: One of ``"genai"``, ``"genai_curriculum"``,
+            ``"augly"``, ``"augly_curriculum"``, ``"robust"``,
+            ``"robust_curriculum"``, ``"robust_curriculum_range"``.
+        total_epochs: Total training epochs (curricular variants).
+        epoch_state: Shared ``multiprocessing.Value('i', 0)``.
+        curriculum_ratio: Fraction of epochs for curriculum ramp.
+        curriculum_n_min: Fixed lower bound for group count.
+        curriculum_n_max_start: Upper bound at epoch 0.
+        curriculum_n_max_end: Upper bound at curriculum completion.
+        scale_state: Shared ``multiprocessing.Value('i', ...)`` for
+            multi-scale training.  When provided, returns a
+            :class:`_MultiscaleMultiViewWrapper`.
+        small_pad_p: Probability of small-crop+reflect-pad path.
+        small_crop_range: ``(min, max)`` pixel range for small crops.
+        moe_tracking: Wrap ``augment_only`` in
+            :class:`TrackingTransformWrapper` for MoE training.
+
+    Returns:
+        ``(shared_spatial, augment_only, to_tensor_norm)`` — or a
+        :class:`_MultiscaleMultiViewWrapper` when ``scale_state`` is set.
+    """
+    # Multi-scale: wrap with dynamic resolution dispatch
+    if scale_state is not None:
+        def _build_for_size(sz):
+            return get_multi_view_transforms(
+                image_size=sz,
+                augmentation=augmentation,
+                total_epochs=total_epochs,
+                epoch_state=epoch_state,
+                curriculum_ratio=curriculum_ratio,
+                curriculum_n_min=curriculum_n_min,
+                curriculum_n_max_start=curriculum_n_max_start,
+                curriculum_n_max_end=curriculum_n_max_end,
+                scale_state=None,  # prevent recursion
+                small_pad_p=small_pad_p,
+                small_crop_range=small_crop_range,
+                moe_tracking=moe_tracking,
+            )
+        return _MultiscaleMultiViewWrapper(
+            _build_for_size, scale_state, image_size,
+        )
+
+    to_tensor_norm = T.Compose(_to_tensor_normalize())
+
+    # ── shared spatial ──────────────────────────────────────────────
+    _SPATIAL_MAP = {
+        "robust": _robust_geometric,
+        "robust_curriculum": _robust_geometric,
+        "robust_curriculum_range": _robust_geometric,
+        "genai": _genai_spatial,
+        "genai_curriculum": _genai_spatial,
+        "augly": _genai_spatial,
+        "augly_curriculum": _genai_spatial,
+    }
+    spatial_fn = _SPATIAL_MAP.get(augmentation)
+    if spatial_fn is None:
+        raise ValueError(
+            f"Multi-view not supported for augmentation={augmentation!r}. "
+            f"Supported: {sorted(_SPATIAL_MAP.keys())}"
+        )
+    shared_spatial = T.Compose(
+        spatial_fn(image_size, small_pad_p=small_pad_p,
+                   small_crop_range=small_crop_range)
+    )
+
+    # ── augment_only (view-1 only) ─────────────────────────────────
+    # Appearance transforms that were part of _genai_geometric
+    _HAS_APPEARANCE = {
+        "genai", "genai_curriculum", "augly", "augly_curriculum",
+    }
+    appearance = _genai_appearance() if augmentation in _HAS_APPEARANCE else []
+
+    if augmentation == "robust":
+        artifact_compose = GroupedNOfCompose(
+            _robust_artifact_groups(), n=4,
+            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
+        )
+        augment_list = (
+            [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
+        )
+        augment_only = T.Compose(augment_list)
+        if moe_tracking:
+            augment_only = TrackingTransformWrapper(
+                augment_only, group_source=artifact_compose,
+            )
+
+    elif augmentation == "robust_curriculum":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        artifact_compose = CurricularGroupedNOfCompose(
+            _robust_artifact_groups(),
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            n_min=2,
+            n_max_start=2,
+            n_max_end=5,
+            curriculum_ratio=curriculum_ratio,
+            weights=_ROBUST_GROUP_WEIGHTS,
+            clean_p_start=0.5,
+            clean_p_end=0.1,
+        )
+        augment_list = (
+            [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
+        )
+        augment_only = T.Compose(augment_list)
+        if moe_tracking:
+            augment_only = TrackingTransformWrapper(
+                augment_only, group_source=artifact_compose,
+            )
+
+    elif augmentation == "robust_curriculum_range":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        artifact_compose = CurricularGroupedNOfCompose(
+            _robust_artifact_groups_extended(),
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            n_min=curriculum_n_min,
+            n_max_start=curriculum_n_max_start,
+            n_max_end=curriculum_n_max_end,
+            curriculum_ratio=curriculum_ratio,
+            weights=_ROBUST_GROUP_WEIGHTS,
+            clean_p_start=0.5,
+            clean_p_end=0.15,
+            intensity_curriculum=True,
+        )
+        augment_list = (
+            [artifact_compose]
+            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.08))]
+            + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
+        )
+        augment_only = T.Compose(augment_list)
+        if moe_tracking:
+            augment_only = TrackingTransformWrapper(
+                augment_only, group_source=artifact_compose,
+            )
+
+    elif augmentation == "genai":
+        augment_only = T.Compose(
+            appearance
+            + [
+                RandomJPEGCompression(quality_range=(30, 95), p=0.5),
+                RandomDownscaleUpscale(scale_range=(0.5, 0.9), p=0.3),
+                RandomGaussianNoise(std_range=(1.0, 10.0), p=0.3),
+                RandomSaltPepperNoise(amount_range=(0.01, 0.08), p=0.05),
+                RandomImpulseNoise(amount_range=(0.01, 0.08), p=0.03),
+                RandomPNGReencode(p=0.2),
+            ]
+        )
+
+    elif augmentation == "genai_curriculum":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        curricular = CurricularWrapper(
+            transforms=[
+                RandomJPEGCompression(quality_range=(30, 95), p=0.5),
+                RandomDownscaleUpscale(scale_range=(0.5, 0.9), p=0.3),
+                RandomGaussianNoise(std_range=(1.0, 10.0), p=0.3),
+                RandomPNGReencode(p=0.2),
+            ],
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            min_scale=0.1,
+            curriculum_ratio=curriculum_ratio,
+        )
+        sp_curricular = CurricularWrapper(
+            transforms=[
+                RandomSaltPepperNoise(amount_range=(0.01, 0.08), p=0.05),
+                RandomImpulseNoise(amount_range=(0.01, 0.08), p=0.03),
+            ],
+            epoch_state=epoch_state,
+            total_epochs=total_epochs,
+            min_scale=0.02,
+            curriculum_ratio=curriculum_ratio,
+        )
+        augment_only = T.Compose(
+            appearance + [curricular, sp_curricular]
+        )
+
+    elif augmentation == "augly":
+        augment_only = T.Compose(
+            appearance
+            + [RandomNOfCompose(_augly_artifact_pool(), n=5)]
+        )
+
+    elif augmentation == "augly_curriculum":
+        if epoch_state is None:
+            import multiprocessing
+            epoch_state = multiprocessing.Value("i", 0)
+        augment_only = T.Compose(
+            appearance
+            + [
+                CurricularNOfCompose(
+                    _augly_artifact_pool(),
+                    epoch_state=epoch_state,
+                    total_epochs=total_epochs,
+                    n_max=5,
+                    n_min=1,
+                    curriculum_ratio=curriculum_ratio,
+                ),
+            ]
+        )
+
+    else:
+        raise ValueError(
+            f"Multi-view not supported for augmentation={augmentation!r}"
+        )
+
+    return shared_spatial, augment_only, to_tensor_norm
 
 
 def get_val_transform(

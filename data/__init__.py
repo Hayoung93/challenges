@@ -9,7 +9,12 @@ from torch.utils.data import ConcatDataset, DataLoader
 from .base import BaseGenAIDataset, MultiViewDataset
 from .dragon import DragonArrowDataset
 from .ntire import NTIREDataset, NTIRETestDataset
-from .transforms import get_train_transform, get_tta_prep_transform, get_val_transform
+from .transforms import (
+    get_multi_view_transforms,
+    get_train_transform,
+    get_tta_prep_transform,
+    get_val_transform,
+)
 
 def _get_inference_transform(args):
     """Select the appropriate transform for inference/validation.
@@ -320,7 +325,8 @@ def build_train_val_loaders(
     # Wrap train datasets for multi-view consistency training
     use_multi_view = getattr(args, "multi_view", False)
     if use_multi_view:
-        transform2 = get_train_transform(
+        small_pad_p = getattr(args, "small_pad_p", 0.0)
+        mv_result = get_multi_view_transforms(
             image_size=train_image_size,
             augmentation=augmentation,
             total_epochs=getattr(args, "epochs", 30),
@@ -330,14 +336,26 @@ def build_train_val_loaders(
             curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
-            clean_view=True,
-            small_pad_p=0.0,  # clean anchor view: no small-pad simulation
+            small_pad_p=small_pad_p,
+            small_crop_range=(
+                getattr(args, "small_crop_range_min", 48),
+                getattr(args, "small_crop_range_max", 192),
+            ),
+            moe_tracking=getattr(args, "moe_enabled", False),
         )
+        if isinstance(mv_result, tuple):
+            shared_spatial, augment_only, to_tensor_norm = mv_result
+        else:
+            # _MultiscaleMultiViewWrapper — resolves transforms at runtime
+            shared_spatial = mv_result
+            augment_only = None
+            to_tensor_norm = None
         for name in dataset_names:
             train_transform_datasets[name] = MultiViewDataset(
-                train_transform_datasets[name], transform2,
+                train_transform_datasets[name],
+                shared_spatial, augment_only, to_tensor_norm,
             )
-        print("  [multi_view] Enabled: view1=augmented, view2=clean (geometric-only)")
+        print("  [multi_view] Enabled: shared spatial + augmented/clean views")
 
     if dataset_mode == "concat":
         combined_train = ConcatDataset(list(train_transform_datasets.values()))
