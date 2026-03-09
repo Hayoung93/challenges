@@ -418,6 +418,141 @@ class MoECriterion(nn.Module):
         return total_loss / count
 
 
+class MoEMultiViewCriterion(nn.Module):
+    """Combined MoE + Multi-View loss.
+
+    ``L = ce_combined + lambda_con * L_supcon + lambda_mvc * L_mvc``
+
+    CE is split across the two views:
+
+    * **Augmented view (view 1)**: expert-routed CE via :class:`MoECriterion`.
+    * **Clean view (view 2)**: CE on the clean expert's logits only.
+    * Combined: ``0.5 * (ce_moe + ce_clean)``, or ``ce_moe`` only when
+      ``mvc_ema=True`` (EMA teacher-student mode).
+
+    SupCon uses backbone projections (unaffected by MoE heads).
+
+    MVC aggregates expert logits to ``(B, C)`` before computing KL
+    divergence: augmented view uses the active-expert average, clean
+    view uses the clean expert directly.
+
+    Args:
+        base_criterion: Per-sample CE loss (CrossEntropyLoss, FocalLoss,
+            or HardSampleMiningLoss wrapping one of these).
+        num_experts: Number of expert heads.
+        clean_expert_idx: Index of the "clean" expert in
+            :data:`~models.moe.EXPERT_GROUPS`.
+        lambda_con: Weight for supervised contrastive loss.
+        lambda_mvc: Weight for multi-view consistency loss.
+        temperature: Temperature for :class:`SupConLoss`.
+        mvc_ema: Use teacher-student mode for MVC and CE.
+    """
+
+    def __init__(
+        self,
+        base_criterion: nn.Module,
+        num_experts: int = 8,
+        clean_expert_idx: int = 7,
+        lambda_con: float = 0.1,
+        lambda_mvc: float = 0.05,
+        temperature: float = 0.07,
+        mvc_ema: bool = False,
+    ):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.num_experts = num_experts
+        self.clean_expert_idx = clean_expert_idx
+        self.lambda_con = lambda_con
+        self.lambda_mvc = lambda_mvc
+        self.mvc_ema = mvc_ema
+
+        self.moe_ce = MoECriterion(base_criterion, num_experts)
+        self.supcon = SupConLoss(temperature)
+        self.mvc = MultiViewConsistencyLoss(teacher_student=mvc_ema)
+
+    def _aggregate_logits(
+        self,
+        all_logits: torch.Tensor,
+        expert_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Weighted average of active experts' logits.
+
+        Args:
+            all_logits: ``(B, K, C)`` logits from all expert heads.
+            expert_masks: ``(B, K)`` binary mask.
+
+        Returns:
+            ``(B, C)`` aggregated logits.
+        """
+        weighted = all_logits * expert_masks.unsqueeze(-1)  # (B, K, C)
+        summed = weighted.sum(dim=1)  # (B, C)
+        counts = expert_masks.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
+        return summed / counts
+
+    def forward(
+        self,
+        all_logits_v1: torch.Tensor,
+        all_logits_v2: torch.Tensor,
+        expert_masks_v1: torch.Tensor,
+        proj1: torch.Tensor,
+        proj2: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple:
+        """Compute combined MoE + multi-view loss.
+
+        Args:
+            all_logits_v1: ``(B, K, C)`` — augmented view expert logits.
+            all_logits_v2: ``(B, K, C)`` — clean view expert logits.
+            expert_masks_v1: ``(B, K)`` — augmented view expert masks.
+            proj1: ``(B, D)`` — augmented view projected embeddings.
+            proj2: ``(B, D)`` — clean view projected embeddings.
+            labels: ``(B,)`` — ground-truth class labels.
+
+        Returns:
+            ``(total_loss, {"ce_moe": float, "ce_clean": float,
+            "ce": float, "supcon": float, "mvc": float})``
+        """
+        # ── CE: augmented view via MoE routing ──
+        ce_moe = self.moe_ce(all_logits_v1, labels, expert_masks_v1)
+
+        # ── CE: clean view via clean expert only ──
+        clean_logits_v2 = all_logits_v2[:, self.clean_expert_idx, :]  # (B, C)
+        ce_clean = self.base_criterion(clean_logits_v2, labels)
+
+        # Combined CE
+        if self.mvc_ema:
+            ce_loss = ce_moe
+        else:
+            ce_loss = 0.5 * (ce_moe + ce_clean)
+
+        # ── SupCon ──
+        proj_all = torch.cat(
+            [proj1, proj2.detach() if self.mvc_ema else proj2], dim=0,
+        )
+        labels_all = torch.cat([labels, labels], dim=0)
+        supcon_loss = self.supcon(proj_all, labels_all)
+
+        # ── MVC: aggregate expert logits to (B, C) then KL ──
+        agg_logits_v1 = self._aggregate_logits(all_logits_v1, expert_masks_v1)
+        agg_logits_v2 = clean_logits_v2
+        mvc_loss = self.mvc(agg_logits_v1, agg_logits_v2)
+
+        total = (
+            ce_loss
+            + self.lambda_con * supcon_loss
+            + self.lambda_mvc * mvc_loss
+        )
+
+        components = {
+            "ce_moe": ce_moe.item(),
+            "ce_clean": ce_clean.item(),
+            "ce": ce_loss.item(),
+            "supcon": supcon_loss.item(),
+            "mvc": mvc_loss.item(),
+        }
+        return total, components
+
+
 def build_criterion(args) -> nn.Module:
     """Build the training loss criterion from config flags.
 

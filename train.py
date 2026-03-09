@@ -82,25 +82,33 @@ def print_rank0(msg, args):
         print(msg)
 
 
-def _update_ohsm_ratio(criterion: nn.Module, ratio: float) -> None:
-    """Update *keep_ratio* on a :class:`HardSampleMiningLoss`, if present."""
-    from losses import HardSampleMiningLoss
+def _find_ohsm(criterion: nn.Module):
+    """Find the :class:`HardSampleMiningLoss` inside *criterion*, if any."""
+    from losses import HardSampleMiningLoss, MoEMultiViewCriterion
 
     if isinstance(criterion, HardSampleMiningLoss):
-        criterion.keep_ratio = ratio
-    elif hasattr(criterion, "ce") and isinstance(criterion.ce, HardSampleMiningLoss):
-        criterion.ce.keep_ratio = ratio
+        return criterion
+    if hasattr(criterion, "ce") and isinstance(criterion.ce, HardSampleMiningLoss):
+        return criterion.ce
+    # MoEMultiViewCriterion or MoECriterion: base_criterion may be OHSM
+    if hasattr(criterion, "base_criterion") and isinstance(
+        criterion.base_criterion, HardSampleMiningLoss
+    ):
+        return criterion.base_criterion
+    return None
+
+
+def _update_ohsm_ratio(criterion: nn.Module, ratio: float) -> None:
+    """Update *keep_ratio* on a :class:`HardSampleMiningLoss`, if present."""
+    ohsm = _find_ohsm(criterion)
+    if ohsm is not None:
+        ohsm.keep_ratio = ratio
 
 
 def _get_ohsm_ratio(criterion: nn.Module):
     """Return current *keep_ratio* or ``None`` if OHSM is not active."""
-    from losses import HardSampleMiningLoss
-
-    if isinstance(criterion, HardSampleMiningLoss):
-        return criterion.keep_ratio
-    if hasattr(criterion, "ce") and isinstance(criterion.ce, HardSampleMiningLoss):
-        return criterion.ce.keep_ratio
-    return None
+    ohsm = _find_ohsm(criterion)
+    return ohsm.keep_ratio if ohsm is not None else None
 
 
 def gather_predictions(local_probs: torch.Tensor, local_labels: torch.Tensor) -> tuple:
@@ -471,8 +479,14 @@ def train_one_epoch(
 
     use_multi_view = getattr(args, "multi_view", False)
     use_moe = getattr(args, "moe_enabled", False)
+    use_moe_mv = use_multi_view and use_moe
     sub_loss_meters = {}
-    if use_multi_view:
+    if use_moe_mv:
+        sub_loss_meters = {
+            k: AverageMeter()
+            for k in ("ce_moe", "ce_clean", "ce", "supcon", "mvc")
+        }
+    elif use_multi_view:
         sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
 
     # Iteration-level multi-scale setup
@@ -509,7 +523,99 @@ def train_one_epoch(
             if ema_teacher is not None:
                 update_mambavision_window_size(ema_teacher, current_ms_size)
 
-        if use_multi_view:
+        if use_moe_mv:
+            # ── MoE + Multi-View combined branch ──
+            views1, views2, labels, _metadata = batch
+            views1 = views1.to(device, non_blocking=True)
+            views2 = views2.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            batch_size = views1.size(0)
+
+            # GPU-side nearest downscale for multi-scale
+            if use_iter_ms and current_ms_size != ms_base_size:
+                views1 = nn.functional.interpolate(
+                    views1, size=current_ms_size, mode="nearest",
+                )
+                views2 = nn.functional.interpolate(
+                    views2, size=current_ms_size, mode="nearest",
+                )
+
+            # Same-label CutMix (multi-view)
+            if _cutmix_active:
+                from data.cutmix import same_label_cutmix_multi_view
+                views1, views2 = same_label_cutmix_multi_view(
+                    views1, views2, labels,
+                    p=args.cutmix_p, alpha=args.cutmix_alpha,
+                )
+
+            # Log augmented/clean pairs to TensorBoard
+            if batch_idx in _img_log_steps:
+                global_step = epoch * len(loader) + batch_idx
+                _log_training_images(
+                    writer, global_step, views1, views2,
+                    count=getattr(args, "tb_log_images_pairs", 4),
+                )
+
+            # Build expert masks for augmented view from metadata
+            from models.moe import EXPERT_GROUP_TO_IDX, NUM_EXPERTS
+
+            expert_masks_v1 = torch.zeros(
+                batch_size, NUM_EXPERTS,
+                device=device, dtype=torch.float32,
+            )
+            for i, meta in enumerate(_metadata):
+                groups = meta.get("aug_groups", frozenset({"clean"}))
+                for g in groups:
+                    idx = EXPERT_GROUP_TO_IDX.get(g)
+                    if idx is not None:
+                        expert_masks_v1[i, idx] = 1.0
+                if not groups or "clean" in groups:
+                    expert_masks_v1[i, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+            # Clean view: always route to clean expert
+            expert_masks_v2 = torch.zeros(
+                batch_size, NUM_EXPERTS,
+                device=device, dtype=torch.float32,
+            )
+            expert_masks_v2[:, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+            with autocast(device_type="cuda", enabled=args.amp):
+                all_logits_v1, _, proj1 = model(
+                    views1, return_embedding=True,
+                    moe_expert_masks=expert_masks_v1,
+                )
+
+                if ema_teacher is not None:
+                    with torch.no_grad():
+                        all_logits_v2, _, proj2 = ema_teacher(
+                            views2, return_embedding=True,
+                            moe_expert_masks=expert_masks_v2,
+                        )
+                else:
+                    all_logits_v2, _, proj2 = model(
+                        views2, return_embedding=True,
+                        moe_expert_masks=expert_masks_v2,
+                    )
+
+                loss, loss_components = criterion(
+                    all_logits_v1, all_logits_v2,
+                    expert_masks_v1, proj1, proj2, labels,
+                )
+
+            # Accuracy: augmented view's active-expert-averaged logits
+            with torch.no_grad():
+                avg_logits = (
+                    all_logits_v1 * expert_masks_v1.unsqueeze(-1)
+                ).sum(dim=1)
+                avg_logits = avg_logits / expert_masks_v1.sum(
+                    dim=1, keepdim=True,
+                ).clamp(min=1)
+            preds = avg_logits.argmax(dim=1)
+
+            for k, v in loss_components.items():
+                sub_loss_meters[k].update(v, batch_size)
+
+        elif use_multi_view:
             views1, views2, labels, _metadata = batch
             views1 = views1.to(device, non_blocking=True)
             views2 = views2.to(device, non_blocking=True)
@@ -643,7 +749,7 @@ def train_one_epoch(
         pbar.set_postfix(postfix)
 
     result = {"loss": loss_meter.avg, "accuracy": acc_meter.avg}
-    if use_multi_view:
+    if sub_loss_meters:
         for k, meter in sub_loss_meters.items():
             result[f"loss_{k}"] = meter.avg
     return result
@@ -912,7 +1018,33 @@ def main():
     from losses import build_criterion
     ce_criterion = build_criterion(args)
 
-    if getattr(args, "multi_view", False):
+    _use_mv = getattr(args, "multi_view", False)
+    _use_moe = getattr(args, "moe_enabled", False)
+
+    if _use_mv and _use_moe:
+        from losses import MoEMultiViewCriterion
+        from models.moe import EXPERT_GROUP_TO_IDX, NUM_EXPERTS
+
+        # ce_criterion is MoECriterion(base_loss) — extract raw base_loss
+        base_loss = ce_criterion.base_criterion
+
+        criterion = MoEMultiViewCriterion(
+            base_criterion=base_loss,
+            num_experts=NUM_EXPERTS,
+            clean_expert_idx=EXPERT_GROUP_TO_IDX["clean"],
+            lambda_con=args.lambda_con,
+            lambda_mvc=args.lambda_mvc,
+            temperature=args.con_temperature,
+            mvc_ema=getattr(args, "mvc_ema", False),
+        )
+        print_rank0(
+            f"  MoE+Multi-view criterion: lambda_con={args.lambda_con}, "
+            f"lambda_mvc={args.lambda_mvc}, temperature={args.con_temperature}"
+            f", num_experts={NUM_EXPERTS}"
+            f"{', mvc_ema=True' if args.mvc_ema else ''}",
+            args,
+        )
+    elif _use_mv:
         from losses import MultiViewCriterion
 
         criterion = MultiViewCriterion(
@@ -1098,9 +1230,9 @@ def main():
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
             if _scale_state is not None:
                 writer.add_scalar("train/image_size", _scale_state.value, epoch)
-            # Multi-view sub-loss components
-            for key in ("loss_ce", "loss_supcon", "loss_mvc"):
-                if key in train_metrics:
+            # Multi-view / MoE+Multi-view sub-loss components
+            for key in train_metrics:
+                if key.startswith("loss_"):
                     writer.add_scalar(f"train/{key}", train_metrics[key], epoch)
             # OHSM keep_ratio tracking
             _ohsm_r = _get_ohsm_ratio(criterion)

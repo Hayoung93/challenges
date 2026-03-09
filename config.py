@@ -541,10 +541,4 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
                 f"--moe_enabled requires --augmentation robust/robust_curriculum/"
                 f"robust_curriculum_range, got '{aug}'"
             )
-        if getattr(args, "multi_view", False):
-            raise ValueError(
-                "--moe_enabled and --multi_view are mutually exclusive. "
-                "MoE training requires single-view mode with expert-routed loss."
-            )
-
     return args
