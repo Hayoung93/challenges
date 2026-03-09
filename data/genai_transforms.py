@@ -602,7 +602,9 @@ class RandomMedianBlur:
         n = max(1, round(len(self.kernel_sizes) * self._intensity))
         effective_sizes = self.kernel_sizes[:n]
         k = random.choice(effective_sizes)
-        return img.filter(ImageFilter.MedianFilter(size=k))
+        arr = np.array(img)
+        arr = cv2.medianBlur(arr, k)
+        return Image.fromarray(arr)
 
     def __repr__(self):
         return (
@@ -843,13 +845,9 @@ class RandomLensBlur:
             return img
         lo, hi = _iscale_upper(self.radius_range, self._intensity)
         radius = random.randint(int(round(lo)), int(round(hi)))
-        kernel = self._make_disk_kernel(radius)
-        arr = np.array(img, dtype=np.float64)
-        for c in range(arr.shape[2]):
-            arr[:, :, c] = scipy.ndimage.convolve(
-                arr[:, :, c], kernel, mode="reflect",
-            )
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        kernel = self._make_disk_kernel(radius).astype(np.float32)
+        arr = np.array(img)
+        arr = cv2.filter2D(arr, -1, kernel, borderType=cv2.BORDER_REFLECT)
         return Image.fromarray(arr)
 
     def __repr__(self):
@@ -1163,13 +1161,9 @@ class RandomMotionBlur:
             sizes = [min_s | 1]
         size = random.choice(sizes)
         angle = random.uniform(0, 360)
-        kernel = self._make_motion_kernel(size, angle)
-        arr = np.array(img, dtype=np.float64)
-        for c in range(arr.shape[2]):
-            arr[:, :, c] = scipy.ndimage.convolve(
-                arr[:, :, c], kernel, mode="reflect",
-            )
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        kernel = self._make_motion_kernel(size, angle).astype(np.float32)
+        arr = np.array(img)
+        arr = cv2.filter2D(arr, -1, kernel, borderType=cv2.BORDER_REFLECT)
         return Image.fromarray(arr)
 
     def __repr__(self):
@@ -2024,7 +2018,9 @@ class IntensityGaussianBlur:
             return img
         lo, hi = _iscale_upper(self.sigma, self._intensity)
         chosen_sigma = random.uniform(lo, max(lo, hi))
-        return TF.gaussian_blur(img, self.kernel_size, [chosen_sigma, chosen_sigma])
+        arr = np.array(img)
+        arr = cv2.GaussianBlur(arr, (self.kernel_size, self.kernel_size), chosen_sigma)
+        return Image.fromarray(arr)
 
     def __repr__(self):
         return (f"{self.__class__.__name__}("
