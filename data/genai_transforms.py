@@ -1971,11 +1971,24 @@ class IntensityRandomPerspective:
         effective_scale = self.distortion_scale * self._intensity
         if effective_scale < 1e-6:
             return img
+        orig_w, orig_h = img.size
         startpoints, endpoints = self._get_params(img.size, effective_scale)
-        return TF.perspective(
+        img = TF.perspective(
             img, startpoints, endpoints,
             interpolation=TF.InterpolationMode.BILINEAR,
         )
+        # Crop to the largest inscribed rectangle to avoid black borders
+        tl, tr, br, bl = endpoints
+        crop_left = max(tl[0], bl[0])
+        crop_right = min(tr[0], br[0])
+        crop_top = max(tl[1], tr[1])
+        crop_bottom = min(bl[1], br[1])
+        crop_w = crop_right - crop_left
+        crop_h = crop_bottom - crop_top
+        if crop_w >= orig_w * 0.5 and crop_h >= orig_h * 0.5:
+            img = TF.crop(img, crop_top, crop_left, crop_h, crop_w)
+            img = img.resize((orig_w, orig_h), Image.NEAREST)
+        return img
 
     @staticmethod
     def _get_params(img_size, distortion_scale):

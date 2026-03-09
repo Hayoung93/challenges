@@ -241,7 +241,6 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
     return [
         first_transform,
         T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.1),
         color_jitter,
         T.RandomGrayscale(p=0.1),
         T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
