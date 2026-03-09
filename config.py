@@ -112,6 +112,8 @@ DEFAULTS = {
     "lambda_mvc": 0.05,       # Multi-view consistency loss weight
     "con_temperature": 0.07,  # SupCon temperature
     "projection_dim": 0,      # Contrastive projection head dimension (0=disabled, auto-set when multi_view)
+    "mvc_ema": False,         # Use EMA teacher for MVC loss (teacher-student mode)
+    "mvc_ema_decay": 0.999,   # EMA decay rate for teacher model
 
     # Test / inference
     "output_dir": "./predictions",
@@ -356,6 +358,13 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--projection_dim", type=int,
                     default=DEFAULTS["projection_dim"],
                     help="Projection head output dimension for contrastive loss")
+    g.add_argument("--mvc_ema", action="store_true",
+                    default=DEFAULTS["mvc_ema"],
+                    help="Use EMA teacher model for MVC loss (teacher-student mode)")
+    g.add_argument("--no_mvc_ema", dest="mvc_ema", action="store_false")
+    g.add_argument("--mvc_ema_decay", type=float,
+                    default=DEFAULTS["mvc_ema_decay"],
+                    help="EMA decay rate for teacher model (0.999 typical)")
     return parser
 
 

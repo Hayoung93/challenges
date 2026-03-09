@@ -70,20 +70,38 @@ class SupConLoss(nn.Module):
 
 
 class MultiViewConsistencyLoss(nn.Module):
-    """Symmetrised KL divergence between two views' softmax distributions."""
+    """KL divergence between two views' softmax distributions.
+
+    Supports two modes:
+
+    * **Symmetric** (default): ``0.5 * (KL(p1 || p2) + KL(p2 || p1))``
+    * **Teacher-student** (``teacher_student=True``): ``KL(student || teacher)``,
+      where *logits1* is the student and *logits2* is the (detached) teacher.
+    """
+
+    def __init__(self, teacher_student: bool = False):
+        super().__init__()
+        self.teacher_student = teacher_student
 
     def forward(
         self, logits1: torch.Tensor, logits2: torch.Tensor
     ) -> torch.Tensor:
-        """Compute symmetrised KL divergence.
+        """Compute KL divergence loss.
 
         Args:
-            logits1: ``(B, C)`` — logits from view 1.
-            logits2: ``(B, C)`` — logits from view 2.
+            logits1: ``(B, C)`` — student (or view 1) logits.
+            logits2: ``(B, C)`` — teacher (or view 2) logits.
 
         Returns:
-            Scalar loss: ``0.5 * (KL(p1 || p2) + KL(p2 || p1))``.
+            Scalar KL divergence loss.
         """
+        if self.teacher_student:
+            # One-directional: student learns to match teacher
+            log_student = F.log_softmax(logits1, dim=1)
+            teacher_prob = F.softmax(logits2.detach(), dim=1)
+            return F.kl_div(log_student, teacher_prob, reduction="batchmean", log_target=False)
+
+        # Symmetric mode (original)
         p1 = F.log_softmax(logits1, dim=1)
         p2 = F.log_softmax(logits2, dim=1)
         q1 = F.softmax(logits1, dim=1)
@@ -115,13 +133,15 @@ class MultiViewCriterion(nn.Module):
         lambda_mvc: float = 0.05,
         temperature: float = 0.07,
         label_smoothing: float = 0.0,
+        mvc_ema: bool = False,
     ):
         super().__init__()
         self.lambda_con = lambda_con
         self.lambda_mvc = lambda_mvc
+        self.mvc_ema = mvc_ema
         self.ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         self.supcon = SupConLoss(temperature=temperature)
-        self.mvc = MultiViewConsistencyLoss()
+        self.mvc = MultiViewConsistencyLoss(teacher_student=mvc_ema)
 
     def forward(
         self,
@@ -133,23 +153,33 @@ class MultiViewCriterion(nn.Module):
     ) -> tuple:
         """Compute combined loss.
 
+        When ``mvc_ema=True``, *logits1/proj1* are from the student and
+        *logits2/proj2* are from the EMA teacher (clean view).  CE is
+        computed on the student only, and SupCon uses student projections
+        from both views (proj2 is detached teacher output).
+
         Args:
-            logits1: ``(B, C)`` — classification logits from view 1.
-            logits2: ``(B, C)`` — classification logits from view 2.
-            proj1: ``(B, D)`` — projected embeddings from view 1.
-            proj2: ``(B, D)`` — projected embeddings from view 2.
+            logits1: ``(B, C)`` — student (or view 1) classification logits.
+            logits2: ``(B, C)`` — teacher (or view 2) classification logits.
+            proj1: ``(B, D)`` — student (or view 1) projected embeddings.
+            proj2: ``(B, D)`` — teacher (or view 2) projected embeddings.
             labels: ``(B,)`` — ground-truth class labels.
 
         Returns:
             ``(total_loss, {"ce": float, "supcon": float, "mvc": float})``
         """
-        ce_loss = 0.5 * (self.ce(logits1, labels) + self.ce(logits2, labels))
+        if self.mvc_ema:
+            # EMA mode: CE on student only
+            ce_loss = self.ce(logits1, labels)
+        else:
+            ce_loss = 0.5 * (self.ce(logits1, labels) + self.ce(logits2, labels))
 
         # SupCon: concat both views' projections and labels
-        proj_all = torch.cat([proj1, proj2], dim=0)
+        proj_all = torch.cat([proj1, proj2.detach() if self.mvc_ema else proj2], dim=0)
         labels_all = torch.cat([labels, labels], dim=0)
         supcon_loss = self.supcon(proj_all, labels_all)
 
+        # MVC: in EMA mode, logits1=student, logits2=teacher (detach inside loss)
         mvc_loss = self.mvc(logits1, logits2)
 
         total = (

@@ -278,6 +278,24 @@ def _log_training_images(
         writer.add_image("train/input_images", grid, global_step)
 
 
+@torch.no_grad()
+def ema_update(student: nn.Module, teacher: nn.Module, decay: float) -> None:
+    """Update teacher parameters as EMA of student parameters."""
+    student_params = dict(student.named_parameters())
+    for name, teacher_param in teacher.named_parameters():
+        if name in student_params:
+            teacher_param.data.mul_(decay).add_(student_params[name].data, alpha=1.0 - decay)
+
+
+def build_ema_teacher(model: nn.Module) -> nn.Module:
+    """Create an EMA teacher by deep-copying the model and freezing it."""
+    import copy
+    teacher = copy.deepcopy(model)
+    for param in teacher.parameters():
+        param.requires_grad = False
+    return teacher
+
+
 class AverageMeter:
     """Computes and stores a running average."""
 
@@ -408,6 +426,7 @@ def train_one_epoch(
     args,
     *,
     writer: SummaryWriter | None = None,
+    ema_teacher: nn.Module | None = None,
 ) -> dict:
     """Train for one epoch. Returns dict with 'loss' and 'accuracy'.
 
@@ -494,7 +513,12 @@ def train_one_epoch(
 
             with autocast(device_type="cuda", enabled=args.amp):
                 logits1, _, proj1 = model(views1, return_embedding=True)
-                logits2, _, proj2 = model(views2, return_embedding=True)
+                if ema_teacher is not None:
+                    # Teacher-student: clean view through EMA teacher (no grad)
+                    with torch.no_grad():
+                        logits2, _, proj2 = ema_teacher(views2, return_embedding=True)
+                else:
+                    logits2, _, proj2 = model(views2, return_embedding=True)
                 loss, loss_components = criterion(
                     logits1, logits2, proj1, proj2, labels,
                 )
@@ -546,6 +570,10 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+
+        # EMA teacher update
+        if ema_teacher is not None:
+            ema_update(model, ema_teacher, args.mvc_ema_decay)
 
         correct = (preds == labels).sum().item()
         loss_meter.update(loss.item(), batch_size)
@@ -665,6 +693,7 @@ def save_checkpoint(
     best_val_auc: float,
     args,
     best_val_acc: float = 0.0,
+    ema_teacher: nn.Module | None = None,
 ) -> None:
     """Save training checkpoint to disk. In DDP, call only on rank 0."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -682,6 +711,9 @@ def save_checkpoint(
         "best_val_acc": best_val_acc,
         "args": args_dict,
     }
+    if ema_teacher is not None:
+        teacher_to_save = ema_teacher.module if hasattr(ema_teacher, "module") else ema_teacher
+        checkpoint["ema_teacher"] = teacher_to_save.state_dict()
     torch.save(checkpoint, path)
     print(f"  Checkpoint saved: {path}")
 
@@ -825,10 +857,12 @@ def main():
             lambda_mvc=args.lambda_mvc,
             temperature=args.con_temperature,
             label_smoothing=args.label_smoothing,
+            mvc_ema=getattr(args, "mvc_ema", False),
         )
         print_rank0(
             f"  Multi-view criterion: lambda_con={args.lambda_con}, "
-            f"lambda_mvc={args.lambda_mvc}, temperature={args.con_temperature}",
+            f"lambda_mvc={args.lambda_mvc}, temperature={args.con_temperature}"
+            f"{', mvc_ema=True' if args.mvc_ema else ''}",
             args,
         )
     else:
@@ -860,6 +894,21 @@ def main():
             f"best_val_auc={best_val_auc:.4f}, best_val_acc={best_val_acc:.4f}",
             args,
         )
+
+    # EMA teacher model for teacher-student MVC
+    ema_teacher = None
+    if getattr(args, "mvc_ema", False) and getattr(args, "multi_view", False):
+        ema_teacher = build_ema_teacher(model)
+        ema_teacher.eval()
+        # Load EMA teacher state from checkpoint if resuming
+        if ckpt is not None and "ema_teacher" in ckpt:
+            ema_state = ckpt["ema_teacher"]
+            target = ema_teacher.module if hasattr(ema_teacher, "module") else ema_teacher
+            target.load_state_dict(ema_state)
+            print_rank0("  Loaded EMA teacher from checkpoint", args)
+        ema_teacher_params = sum(p.numel() for p in ema_teacher.parameters())
+        print_rank0(f"  EMA teacher: {ema_teacher_params:,} params, "
+                    f"decay={args.mvc_ema_decay}", args)
 
     # TensorBoard — only rank 0
     writer = None
@@ -945,6 +994,7 @@ def main():
             model, train_loader, criterion, optimizer, scheduler,
             scaler, device, epoch, args,
             writer=writer,
+            ema_teacher=ema_teacher,
         )
 
         if writer is not None:
@@ -1001,6 +1051,7 @@ def main():
                     os.path.join(args.save_dir, "best_auc.pth"),
                     model, optimizer, scheduler, scaler, epoch,
                     val_auc, args, best_val_acc=best_val_acc,
+                    ema_teacher=ema_teacher,
                 )
 
             # Best accuracy tracking (independent)
@@ -1010,6 +1061,7 @@ def main():
                     os.path.join(args.save_dir, "best_acc.pth"),
                     model, optimizer, scheduler, scaler, epoch,
                     best_val_auc, args, best_val_acc=val_acc,
+                    ema_teacher=ema_teacher,
                 )
 
         # Periodic checkpoint (rank 0 only)
@@ -1018,6 +1070,7 @@ def main():
                 os.path.join(args.save_dir, f"epoch_{epoch}.pth"),
                 model, optimizer, scheduler, scaler, epoch,
                 early_stopping.best_score, args, best_val_acc=best_val_acc,
+                ema_teacher=ema_teacher,
             )
 
         # Last checkpoint — overwrite every epoch (rank 0 only)
@@ -1026,6 +1079,7 @@ def main():
                 os.path.join(args.save_dir, "last.pth"),
                 model, optimizer, scheduler, scaler, epoch,
                 early_stopping.best_score, args, best_val_acc=best_val_acc,
+                ema_teacher=ema_teacher,
             )
 
         if writer is not None:
@@ -1082,6 +1136,7 @@ def main():
             model, optimizer, scheduler, scaler,
             epoch, early_stopping.best_score, args,
             best_val_acc=best_val_acc,
+            ema_teacher=ema_teacher,
         )
 
     if writer is not None:
