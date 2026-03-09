@@ -664,6 +664,7 @@ def save_checkpoint(
     epoch: int,
     best_val_auc: float,
     args,
+    best_val_acc: float = 0.0,
 ) -> None:
     """Save training checkpoint to disk. In DDP, call only on rank 0."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -678,6 +679,7 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "best_val_auc": best_val_auc,
+        "best_val_acc": best_val_acc,
         "args": args_dict,
     }
     torch.save(checkpoint, path)
@@ -838,6 +840,7 @@ def main():
     # Resume
     start_epoch = 0
     best_val_auc = 0.0
+    best_val_acc = 0.0
     ckpt = None
     if args.resume:
         print_rank0(f"Resuming from: {args.resume}", args)
@@ -851,7 +854,12 @@ def main():
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_val_auc = ckpt.get("best_val_auc", ckpt.get("best_val_acc", 0.0))
-        print_rank0(f"  Resumed at epoch {start_epoch}, best_val_auc={best_val_auc:.4f}", args)
+        best_val_acc = ckpt.get("best_val_acc", 0.0)
+        print_rank0(
+            f"  Resumed at epoch {start_epoch}, "
+            f"best_val_auc={best_val_auc:.4f}, best_val_acc={best_val_acc:.4f}",
+            args,
+        )
 
     # TensorBoard — only rank 0
     writer = None
@@ -983,13 +991,25 @@ def main():
             if val_auc is None:
                 print_rank0("  WARNING: AUC not available, falling back to accuracy", args)
                 val_auc = val_metrics["accuracy"]
+            val_acc = val_metrics["accuracy"]
 
-            improved = early_stopping.step(val_auc, epoch)
-            if improved and is_main_process(args):
+            # Best AUC tracking (drives early stopping)
+            auc_improved = early_stopping.step(val_auc, epoch)
+            if auc_improved and is_main_process(args):
+                best_val_auc = val_auc
                 save_checkpoint(
-                    os.path.join(args.save_dir, "best.pth"),
+                    os.path.join(args.save_dir, "best_auc.pth"),
                     model, optimizer, scheduler, scaler, epoch,
-                    val_auc, args,
+                    val_auc, args, best_val_acc=best_val_acc,
+                )
+
+            # Best accuracy tracking (independent)
+            if val_acc > best_val_acc and is_main_process(args):
+                best_val_acc = val_acc
+                save_checkpoint(
+                    os.path.join(args.save_dir, "best_acc.pth"),
+                    model, optimizer, scheduler, scaler, epoch,
+                    best_val_auc, args, best_val_acc=val_acc,
                 )
 
         # Periodic checkpoint (rank 0 only)
@@ -997,7 +1017,15 @@ def main():
             save_checkpoint(
                 os.path.join(args.save_dir, f"epoch_{epoch}.pth"),
                 model, optimizer, scheduler, scaler, epoch,
-                early_stopping.best_score, args,
+                early_stopping.best_score, args, best_val_acc=best_val_acc,
+            )
+
+        # Last checkpoint — overwrite every epoch (rank 0 only)
+        if is_main_process(args):
+            save_checkpoint(
+                os.path.join(args.save_dir, "last.pth"),
+                model, optimizer, scheduler, scaler, epoch,
+                early_stopping.best_score, args, best_val_acc=best_val_acc,
             )
 
         if writer is not None:
@@ -1038,11 +1066,13 @@ def main():
                     f"  Best val AUC: {early_stopping.best_score:.4f} "
                     f"(epoch {early_stopping.best_epoch})", args,
                 )
+                print_rank0(f"  Best val accuracy: {best_val_acc:.4f}", args)
                 break
         else:
             if early_stopping.should_stop:
                 print(f"\nEarly stopping at epoch {epoch}.")
                 print(f"  Best val AUC: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})")
+                print(f"  Best val accuracy: {best_val_acc:.4f}")
                 break
 
     # Save final checkpoint (rank 0 only)
@@ -1051,6 +1081,7 @@ def main():
             os.path.join(args.save_dir, "last.pth"),
             model, optimizer, scheduler, scaler,
             epoch, early_stopping.best_score, args,
+            best_val_acc=best_val_acc,
         )
 
     if writer is not None:
@@ -1058,6 +1089,7 @@ def main():
 
     print_rank0(f"\nTraining complete.", args)
     print_rank0(f"  Best val AUC: {early_stopping.best_score:.4f} (epoch {early_stopping.best_epoch})", args)
+    print_rank0(f"  Best val accuracy: {best_val_acc:.4f}", args)
     if is_main_process(args):
         print(f"  Checkpoints: {args.save_dir}")
         print(f"  TensorBoard: {os.path.join(args.log_dir, run_name)}")
