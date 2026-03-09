@@ -316,9 +316,6 @@ class GenAIClassifier(nn.Module):
             if freeze_backbone:
                 self._freeze_backbone()
 
-        if checkpoint_path:
-            self._load_checkpoint(checkpoint_path)
-
         # Projection head for contrastive learning (used only during training).
         # For WSGM, the embedding dim is the wrapper's final_dim.
         feat_dim = self.backbone.embed_dim if wsgm else self._num_features
@@ -331,6 +328,9 @@ class GenAIClassifier(nn.Module):
             )
         else:
             self.projection_head = None
+
+        if checkpoint_path:
+            self._load_checkpoint(checkpoint_path)
 
     def _freeze_backbone(self):
         """Freeze all parameters except the head, LoRA, and ConvLoRA."""
@@ -433,6 +433,22 @@ class GenAIClassifier(nn.Module):
                     unexpected_keys=[
                         k for k in result.unexpected_keys
                         if not k.startswith("moe_head.")
+                    ]
+                )
+
+        # Load projection head parameters separately (they live outside backbone).
+        if self.projection_head is not None:
+            proj_state = {
+                k.removeprefix("projection_head."): v
+                for k, v in filtered_state.items()
+                if k.startswith("projection_head.")
+            }
+            if proj_state:
+                self.projection_head.load_state_dict(proj_state, strict=False)
+                result = result._replace(
+                    unexpected_keys=[
+                        k for k in result.unexpected_keys
+                        if not k.startswith("projection_head.")
                     ]
                 )
 
