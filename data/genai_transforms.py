@@ -1240,6 +1240,118 @@ class RandomPosterize:
         )
 
 
+class RandomColorSaturation:
+    """Randomly adjust colour saturation via ``ImageEnhance.Color``.
+
+    A factor of 0 produces a grayscale image, 1 leaves the image
+    unchanged, and values above 1 boost saturation.  This mirrors the
+    ``colorsat`` distortion in ``aug_utils_train`` and fills a gap in the
+    ``robust_curriculum_range`` colour group.
+
+    Args:
+        factor_range: ``(min_factor, max_factor)``.  Neutral point is 1.0.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, factor_range=(0.0, 2.0), p=0.3):
+        self.factor_range = factor_range
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        lo, hi = _iscale_neutral(self.factor_range, self._intensity, neutral=1.0)
+        factor = random.uniform(lo, hi)
+        return ImageEnhance.Color(img).enhance(factor)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"factor_range={self.factor_range}, p={self.p})"
+        )
+
+
+class RandomHueShift:
+    """Randomly rotate the hue channel in HSV space.
+
+    Shifts all hue values by a random offset sampled from
+    ``degrees_range``, wrapping around the 0–360 circle.  Saturation
+    and value channels are left untouched.
+
+    Args:
+        degrees_range: ``(min_degrees, max_degrees)`` hue rotation.
+            Neutral point is 0.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, degrees_range=(-30.0, 30.0), p=0.3):
+        self.degrees_range = degrees_range
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        lo, hi = _iscale_neutral(self.degrees_range, self._intensity, neutral=0.0)
+        degrees = random.uniform(lo, hi)
+        arr = np.array(img, dtype=np.float32)
+        # Convert RGB [0,255] → HSV with H in [0,360], S/V in [0,1]
+        arr_01 = arr / 255.0
+        hsv = cv2.cvtColor(arr_01, cv2.COLOR_RGB2HSV)
+        hsv[:, :, 0] = (hsv[:, :, 0] + degrees) % 360.0
+        rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(rgb)
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"degrees_range={self.degrees_range}, p={self.p})"
+        )
+
+
+class RandomColorShift:
+    """Randomly shift a colour channel spatially (chromatic aberration).
+
+    Selects one of the R/G/B channels at random and displaces it by a
+    sub-pixel amount in a random direction, simulating lateral chromatic
+    aberration common in low-quality lenses.  This corresponds to the
+    ``colorshift`` distortion in ``aug_utils_train``.
+
+    Args:
+        amount_range: ``(min_px, max_px)`` displacement in pixels.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, amount_range=(0.5, 8.0), p=0.3):
+        self.amount_range = amount_range
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        lo, hi = _iscale_upper(self.amount_range, self._intensity)
+        amount = random.uniform(lo, hi)
+        # Random direction
+        angle = random.uniform(0, 2 * math.pi)
+        shift_y = amount * math.sin(angle)
+        shift_x = amount * math.cos(angle)
+        arr = np.array(img, dtype=np.float64)
+        channel = random.randint(0, 2)
+        arr[:, :, channel] = scipy.ndimage.shift(
+            arr[:, :, channel], (shift_y, shift_x), order=1, mode="reflect",
+        )
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"amount_range={self.amount_range}, p={self.p})"
+        )
+
+
 class RandomChromaNoise:
     """Add Gaussian noise only to chrominance (Cb, Cr) channels.
 
