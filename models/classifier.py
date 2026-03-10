@@ -613,11 +613,14 @@ class GenAIClassifier(nn.Module):
             else:
                 # === Inference: K forward passes → entropy aggregate ===
                 all_logits = []
+                all_features = [] if return_embedding else None
                 for k in range(self.lora_moe_num_experts):
                     set_active_expert(self, k)
                     feat_k = self._extract_features(x)     # (B, D)
                     logits_k = self.backbone.head(feat_k)   # (B, C)
                     all_logits.append(logits_k)
+                    if all_features is not None:
+                        all_features.append(feat_k)
                 clear_lora_moe_state(self)
 
                 stacked = torch.stack(all_logits, dim=1)    # (B, K, C)
@@ -627,7 +630,15 @@ class GenAIClassifier(nn.Module):
                 )
 
                 if return_embedding:
-                    features = self._extract_features(x)  # fallback (no LoRA)
+                    # Entropy-weighted average of per-expert features.
+                    from .moe import _entropy_weights
+                    weights = _entropy_weights(
+                        stacked, temperatures, self.num_classes,
+                    )  # (B, K)
+                    feat_stacked = torch.stack(all_features, dim=1)  # (B, K, D)
+                    features = (
+                        feat_stacked * weights.unsqueeze(-1)
+                    ).sum(dim=1)  # (B, D)
                     projection = None
                     if self.projection_head is not None:
                         projection = self.projection_head(features)

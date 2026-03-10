@@ -32,12 +32,12 @@ NUM_EXPERTS = len(EXPERT_GROUPS)
 EXPERT_GROUP_TO_IDX = {name: i for i, name in enumerate(EXPERT_GROUPS)}
 
 
-def entropy_weighted_aggregate(
+def _entropy_weights(
     all_logits: torch.Tensor,
     temperatures: torch.Tensor,
     num_classes: int = 2,
 ) -> torch.Tensor:
-    """Entropy-weighted combination of expert logits.
+    """Compute normalised entropy-based confidence weights for experts.
 
     Args:
         all_logits: ``(B, K, C)`` raw logits from each expert.
@@ -45,7 +45,7 @@ def entropy_weighted_aggregate(
         num_classes: Number of output classes (used for max entropy).
 
     Returns:
-        ``(B, C)`` aggregated logits.
+        ``(B, K)`` normalised weights (sum to 1 per sample).
     """
     # Temperature scaling: (1, K, 1) broadcasts over batch and classes.
     temps = temperatures.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
@@ -69,7 +69,30 @@ def entropy_weighted_aggregate(
 
     # Normalise so weights sum to 1 per sample.
     weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    weights = weights / weight_sum  # (B, K)
+    return weights / weight_sum  # (B, K)
+
+
+def entropy_weighted_aggregate(
+    all_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    num_classes: int = 2,
+) -> torch.Tensor:
+    """Entropy-weighted combination of expert logits.
+
+    Args:
+        all_logits: ``(B, K, C)`` raw logits from each expert.
+        temperatures: ``(K,)`` positive per-expert temperature scalars.
+        num_classes: Number of output classes (used for max entropy).
+
+    Returns:
+        ``(B, C)`` aggregated logits.
+    """
+    weights = _entropy_weights(all_logits, temperatures, num_classes)  # (B, K)
+
+    # Temperature scaling for probability combination.
+    temps = temperatures.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
+    scaled_logits = all_logits / temps  # (B, K, C)
+    probs = F.softmax(scaled_logits, dim=-1)  # (B, K, C)
 
     # Weighted combination of probability distributions.
     combined_probs = (weights.unsqueeze(-1) * probs).sum(dim=1)  # (B, C)

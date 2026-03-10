@@ -586,8 +586,4 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
                 f"--lora_moe_enabled requires --augmentation robust/"
                 f"robust_curriculum/robust_curriculum_range, got '{aug}'"
             )
-        if getattr(args, "multi_view", False):
-            raise ValueError(
-                "--lora_moe_enabled and --multi_view are mutually exclusive"
-            )
     return args

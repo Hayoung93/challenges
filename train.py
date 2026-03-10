@@ -502,8 +502,11 @@ def train_one_epoch(
     use_moe = getattr(args, "moe_enabled", False)
     use_lora_moe = getattr(args, "lora_moe_enabled", False)
     use_moe_mv = use_multi_view and use_moe
+    use_lora_moe_mv = use_multi_view and use_lora_moe
     sub_loss_meters = {}
-    if use_moe_mv:
+    if use_lora_moe_mv:
+        sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
+    elif use_moe_mv:
         sub_loss_meters = {
             k: AverageMeter()
             for k in ("ce_moe", "ce_clean", "ce", "supcon", "mvc")
@@ -634,6 +637,90 @@ def train_one_epoch(
                 ).clamp(min=1)
             preds = avg_logits.argmax(dim=1)
 
+            for k, v in loss_components.items():
+                sub_loss_meters[k].update(v, batch_size)
+
+        elif use_lora_moe_mv:
+            # ── LoRA-MoE + Multi-View combined branch ──
+            # LoRA-MoE outputs (B, C) via shared head (not B,K,C),
+            # so we use standard MultiViewCriterion.
+            views1, views2, labels, _metadata = batch
+            views1 = views1.to(device, non_blocking=True)
+            views2 = views2.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            batch_size = views1.size(0)
+
+            # GPU-side nearest downscale for multi-scale
+            if use_iter_ms and current_ms_size != ms_base_size:
+                views1 = nn.functional.interpolate(
+                    views1, size=current_ms_size, mode="nearest",
+                )
+                views2 = nn.functional.interpolate(
+                    views2, size=current_ms_size, mode="nearest",
+                )
+
+            # Same-label CutMix (multi-view)
+            if _cutmix_active:
+                from data.cutmix import same_label_cutmix_multi_view
+                views1, views2 = same_label_cutmix_multi_view(
+                    views1, views2, labels,
+                    p=args.cutmix_p, alpha=args.cutmix_alpha,
+                )
+
+            # Log augmented/clean pairs to TensorBoard
+            if batch_idx in _img_log_steps:
+                global_step = epoch * len(loader) + batch_idx
+                _log_training_images(
+                    writer, global_step, views1, views2,
+                    count=getattr(args, "tb_log_images_pairs", 4),
+                )
+
+            # Build expert masks for augmented view from metadata
+            from models.moe import EXPERT_GROUP_TO_IDX, NUM_EXPERTS
+
+            expert_masks_v1 = torch.zeros(
+                batch_size, NUM_EXPERTS,
+                device=device, dtype=torch.float32,
+            )
+            for i, meta in enumerate(_metadata):
+                groups = meta.get("aug_groups", frozenset({"clean"}))
+                for g in groups:
+                    idx = EXPERT_GROUP_TO_IDX.get(g)
+                    if idx is not None:
+                        expert_masks_v1[i, idx] = 1.0
+                if not groups or "clean" in groups:
+                    expert_masks_v1[i, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+            # Clean view: always route to clean expert
+            expert_masks_v2 = torch.zeros(
+                batch_size, NUM_EXPERTS,
+                device=device, dtype=torch.float32,
+            )
+            expert_masks_v2[:, EXPERT_GROUP_TO_IDX["clean"]] = 1.0
+
+            with autocast(device_type="cuda", enabled=args.amp):
+                logits1, _, proj1 = model(
+                    views1, return_embedding=True,
+                    moe_expert_masks=expert_masks_v1,
+                )
+
+                if ema_teacher is not None:
+                    with torch.no_grad():
+                        logits2, _, proj2 = ema_teacher(
+                            views2, return_embedding=True,
+                            moe_expert_masks=expert_masks_v2,
+                        )
+                else:
+                    logits2, _, proj2 = model(
+                        views2, return_embedding=True,
+                        moe_expert_masks=expert_masks_v2,
+                    )
+
+                loss, loss_components = criterion(
+                    logits1, logits2, proj1, proj2, labels,
+                )
+
+            preds = logits1.argmax(dim=1)
             for k, v in loss_components.items():
                 sub_loss_meters[k].update(v, batch_size)
 
