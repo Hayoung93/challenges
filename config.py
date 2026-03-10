@@ -17,6 +17,9 @@ DEFAULTS = {
     "train_sampling": False,       # enable training data sub-sampling
     "train_sample_ratio": 0.1,    # fraction of training data per epoch (when enabled)
 
+    # Distorted validation (pre-generated images for robust model selection)
+    "distorted_val_dir": "",  # path to distorted val dir; empty = disabled
+
     # DataLoader
     "batch_size": 32,
     "num_workers": 8,
@@ -32,8 +35,8 @@ DEFAULTS = {
     "resize_size": 256,
     "augmentation": "default",  # "none", "default", "strong", "genai", "genai_curriculum", "augly", "augly_curriculum"
     "curriculum_ratio": 0.5,  # fraction of total epochs for curriculum to reach max (0.5 = halfway)
-    "curriculum_n_min": 2,        # fixed lower bound for group count sampling
-    "curriculum_n_max_start": 3,  # upper bound at epoch 0
+    "curriculum_n_min": 1,        # fixed lower bound for group count sampling
+    "curriculum_n_max_start": 1,  # upper bound at epoch 0
     "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
     # Small-crop reflect-pad augmentation (simulates tiny test images)
@@ -183,6 +186,11 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Test subset: 1=val_images, 2=val_images_hard, 3=both")
     g.add_argument("--val_split_ratio", type=float, default=DEFAULTS["val_split_ratio"],
                     help="Fraction of training data to hold out for validation")
+    g.add_argument("--distorted_val_dir", type=str,
+                    default=DEFAULTS["distorted_val_dir"],
+                    help="Path to pre-generated distorted val images "
+                         "(from scripts/generate_distorted_val.py). "
+                         "Empty string = disabled (clean val only)")
     g.add_argument("--train_sampling", action="store_true",
                     default=DEFAULTS["train_sampling"],
                     help="Enable training data sub-sampling (use fraction of data per epoch)")

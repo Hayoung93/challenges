@@ -910,6 +910,7 @@ def validate(
     device: torch.device,
     epoch: int,
     args,
+    prefix: str = "Val",
 ) -> dict:
     """Run validation. Returns dict with 'loss', 'accuracy' (and 'auc', 'f1' if sklearn available)."""
     model.eval()
@@ -919,7 +920,7 @@ def validate(
     all_probs = []
     all_labels = []
 
-    pbar = tqdm(loader, desc=f"Val   Epoch {epoch}", leave=False,
+    pbar = tqdm(loader, desc=f"{prefix:<8s} Epoch {epoch}", leave=False,
                 disable=not is_main_process(args))
     with torch.no_grad():
         for images, labels, _metadata in pbar:
@@ -1087,7 +1088,7 @@ def main():
 
     # Data
     print_rank0("Building data loaders...", args)
-    train_loader, val_loader = build_train_val_loaders(args)
+    train_loader, val_loader, distorted_val_loader = build_train_val_loaders(args)
     steps_per_epoch = len(train_loader)
     print_rank0(f"  Steps per epoch: {steps_per_epoch}", args)
 
@@ -1414,6 +1415,7 @@ def main():
 
         # Validate
         val_metrics = None
+        distorted_val_metrics = None
         _use_iter_ms = getattr(args, "multiscale", False) and getattr(args, "multiscale_interval", 0) > 0
         _need_window_restore = _scale_state is not None or _use_iter_ms
         if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
@@ -1422,30 +1424,51 @@ def main():
                 from models.classifier import update_mambavision_window_size
                 update_mambavision_window_size(model, args.image_size)
 
-            val_metrics = validate(model, val_loader, val_criterion, device, epoch, args)
+            val_metrics = validate(model, val_loader, val_criterion, device, epoch, args,
+                                   prefix="Val")
+
+            # Distorted validation (primary for model selection when available)
+            if distorted_val_loader is not None:
+                distorted_val_metrics = validate(
+                    model, distorted_val_loader, val_criterion, device, epoch, args,
+                    prefix="DistVal",
+                )
 
             # MambaVision: re-apply scale for next training epoch
             # (per-epoch mode only; iteration-level resets at next batch)
             if _scale_state is not None:
                 update_mambavision_window_size(model, _scale_state.value)
 
+            # TensorBoard logging
             if writer is not None:
-                writer.add_scalar("val/loss", val_metrics["loss"], epoch)
-                writer.add_scalar("val/accuracy", val_metrics["accuracy"], epoch)
-                if "auc" in val_metrics:
-                    writer.add_scalar("val/auc", val_metrics["auc"], epoch)
-                if "f1" in val_metrics:
-                    writer.add_scalar("val/f1", val_metrics["f1"], epoch)
-                if "precision" in val_metrics:
-                    writer.add_scalar("val/precision", val_metrics["precision"], epoch)
-                if "recall" in val_metrics:
-                    writer.add_scalar("val/recall", val_metrics["recall"], epoch)
+                # When distorted val is active: val/ = distorted, val_clean/ = clean
+                # When disabled: val/ = clean (legacy behaviour)
+                if distorted_val_metrics is not None:
+                    _tb_prefix_clean = "val_clean"
+                    _tb_prefix_primary = "val"
+                    for _pfx, _m in [(_tb_prefix_clean, val_metrics),
+                                     (_tb_prefix_primary, distorted_val_metrics)]:
+                        writer.add_scalar(f"{_pfx}/loss", _m["loss"], epoch)
+                        writer.add_scalar(f"{_pfx}/accuracy", _m["accuracy"], epoch)
+                        for _k in ("auc", "f1", "precision", "recall"):
+                            if _k in _m:
+                                writer.add_scalar(f"{_pfx}/{_k}", _m[_k], epoch)
+                else:
+                    writer.add_scalar("val/loss", val_metrics["loss"], epoch)
+                    writer.add_scalar("val/accuracy", val_metrics["accuracy"], epoch)
+                    for _k in ("auc", "f1", "precision", "recall"):
+                        if _k in val_metrics:
+                            writer.add_scalar(f"val/{_k}", val_metrics[_k], epoch)
 
-            val_auc = val_metrics.get("auc")
+            # Select primary metrics for model selection
+            primary_metrics = (distorted_val_metrics
+                               if distorted_val_metrics is not None
+                               else val_metrics)
+            val_auc = primary_metrics.get("auc")
             if val_auc is None:
                 print_rank0("  WARNING: AUC not available, falling back to accuracy", args)
-                val_auc = val_metrics["accuracy"]
-            val_acc = val_metrics["accuracy"]
+                val_auc = primary_metrics["accuracy"]
+            val_acc = primary_metrics["accuracy"]
 
             # Best AUC tracking (drives early stopping)
             auc_improved = early_stopping.step(val_auc, epoch)
@@ -1498,14 +1521,24 @@ def main():
             summary += f" | train_loss={train_metrics['loss']:.4f}"
             summary += f" train_acc={train_metrics['accuracy']:.4f}"
             if val_metrics:
-                summary += f" | val_loss={val_metrics['loss']:.4f}"
-                summary += f" val_acc={val_metrics['accuracy']:.4f}"
-                if "auc" in val_metrics:
-                    summary += f" val_auc={val_metrics['auc']:.4f}"
-                if "precision" in val_metrics:
-                    summary += f" val_prec={val_metrics['precision']:.4f}"
-                if "recall" in val_metrics:
-                    summary += f" val_rec={val_metrics['recall']:.4f}"
+                if distorted_val_metrics is not None:
+                    # Show both clean and distorted AUC
+                    summary += f" | clean_auc={val_metrics.get('auc', 0):.4f}"
+                    summary += f" dist_auc={distorted_val_metrics.get('auc', 0):.4f}"
+                    summary += f" dist_acc={distorted_val_metrics['accuracy']:.4f}"
+                    if "precision" in distorted_val_metrics:
+                        summary += f" dist_prec={distorted_val_metrics['precision']:.4f}"
+                    if "recall" in distorted_val_metrics:
+                        summary += f" dist_rec={distorted_val_metrics['recall']:.4f}"
+                else:
+                    summary += f" | val_loss={val_metrics['loss']:.4f}"
+                    summary += f" val_acc={val_metrics['accuracy']:.4f}"
+                    if "auc" in val_metrics:
+                        summary += f" val_auc={val_metrics['auc']:.4f}"
+                    if "precision" in val_metrics:
+                        summary += f" val_prec={val_metrics['precision']:.4f}"
+                    if "recall" in val_metrics:
+                        summary += f" val_rec={val_metrics['recall']:.4f}"
             summary += f" | lr={optimizer.param_groups[0]['lr']:.2e}"
             if early_stopping.enabled:
                 summary += f" | patience={early_stopping.counter}/{early_stopping.patience}"
