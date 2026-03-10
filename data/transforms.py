@@ -456,7 +456,7 @@ def _robust_artifact_groups_extended() -> dict:
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
-            IntensityRandomPerspective(distortion_scale=0.2),
+            IntensityRandomPerspective(distortion_scale=0.45),
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
