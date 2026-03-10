@@ -40,6 +40,43 @@ def _rand_bbox(H: int, W: int, lam: float):
     return y1, x1, y2, x2
 
 
+def _rand_bbox_mask(B: int, H: int, W: int, lam: float,
+                    device: torch.device) -> torch.Tensor | None:
+    """Generate per-sample random bounding box masks for CutMix.
+
+    Each sample gets an independent random box position, but all boxes
+    share the same size (determined by *lam*) to keep the mixing ratio
+    consistent across the batch.
+
+    Returns:
+        ``(B, 1, H, W)`` boolean mask tensor, or ``None`` if the box
+        size is degenerate (height or width < 2).
+    """
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_h = int(H * cut_ratio)
+    cut_w = int(W * cut_ratio)
+
+    if cut_h < 2 or cut_w < 2:
+        return None
+
+    # Per-sample random centers
+    cy = torch.randint(0, H, (B,), device=device)
+    cx = torch.randint(0, W, (B,), device=device)
+
+    y1 = (cy - cut_h // 2).clamp(min=0)
+    x1 = (cx - cut_w // 2).clamp(min=0)
+    y2 = (y1 + cut_h).clamp(max=H)
+    x2 = (x1 + cut_w).clamp(max=W)
+
+    # Build mask: (B, 1, H, W)
+    rows = torch.arange(H, device=device).view(1, 1, H, 1)
+    cols = torch.arange(W, device=device).view(1, 1, 1, W)
+
+    mask = ((rows >= y1.view(B, 1, 1, 1)) & (rows < y2.view(B, 1, 1, 1))
+            & (cols >= x1.view(B, 1, 1, 1)) & (cols < x2.view(B, 1, 1, 1)))
+    return mask
+
+
 def _build_perm_index(labels):
     """Build a batch-wide permutation index for same-label pairing.
 
@@ -82,15 +119,12 @@ def same_label_cutmix(
 
     B, C, H, W = images.shape
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    bbox = _rand_bbox(H, W, lam)
-    if bbox is None:
+    mask = _rand_bbox_mask(B, H, W, lam, images.device)
+    if mask is None:
         return images
 
-    y1, x1, y2, x2 = bbox
     perm_idx = _build_perm_index(labels)
-    result = images.clone()
-    result[:, :, y1:y2, x1:x2] = images[perm_idx, :, y1:y2, x1:x2]
-    return result
+    return torch.where(mask, images[perm_idx], images)
 
 
 def same_label_cutmix_multi_view(
@@ -119,14 +153,11 @@ def same_label_cutmix_multi_view(
 
     B, C, H, W = views1.shape
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    bbox = _rand_bbox(H, W, lam)
-    if bbox is None:
+    mask = _rand_bbox_mask(B, H, W, lam, views1.device)
+    if mask is None:
         return views1, views2
 
-    y1, x1, y2, x2 = bbox
     perm_idx = _build_perm_index(labels)
-    result1 = views1.clone()
-    result2 = views2.clone()
-    result1[:, :, y1:y2, x1:x2] = views1[perm_idx, :, y1:y2, x1:x2]
-    result2[:, :, y1:y2, x1:x2] = views2[perm_idx, :, y1:y2, x1:x2]
+    result1 = torch.where(mask, views1[perm_idx], views1)
+    result2 = torch.where(mask, views2[perm_idx], views2)
     return result1, result2
