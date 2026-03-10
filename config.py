@@ -97,6 +97,9 @@ DEFAULTS = {
     "lora_moe_convlora_alpha": 4.0,
     "lora_moe_convlora_dropout": 0.0,
 
+    # Expert diversity loss (LoRA-MoE regularization)
+    "lambda_diversity": 0.0,  # 0.0 = disabled; 0.01-0.1 recommended
+
     # Training hyperparameters
     "lr": 1e-4,
     "weight_decay": 0.05,
@@ -430,6 +433,13 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--ohsm_curriculum_start_epoch", type=int,
                     default=DEFAULTS["ohsm_curriculum_start_epoch"],
                     help="Epoch at which OHSM curriculum begins ramping")
+    # Expert diversity loss
+    g.add_argument("--lambda_diversity", type=float,
+                    default=DEFAULTS["lambda_diversity"],
+                    help="Weight for expert diversity loss (LoRA-MoE only). "
+                         "Penalizes cosine similarity between expert weight "
+                         "deltas to prevent collapse. 0.0=disabled, "
+                         "0.01-0.1 recommended.")
     # TensorBoard image logging
     g.add_argument("--tb_log_images", action="store_true",
                     default=DEFAULTS["tb_log_images"],

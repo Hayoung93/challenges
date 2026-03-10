@@ -553,6 +553,81 @@ class MoEMultiViewCriterion(nn.Module):
         return total, components
 
 
+class ExpertDiversityLoss(nn.Module):
+    """Weight-space diversity regularization for LoRA-MoE experts.
+
+    Computes the mean pairwise cosine similarity between expert weight
+    deltas across all LoRA-MoE layers in the model.  Minimizing this
+    loss encourages experts to learn orthogonal weight modifications.
+
+    The effective weight delta for expert *k* is:
+
+    * **Linear**: ``lora_ups[k].weight @ lora_downs[k].weight``
+    * **Conv2d**: ``lora_Bs[k] @ lora_As[k]``
+
+    Each delta is flattened to a vector, and pairwise cosine similarities
+    are averaged.  The loss is then averaged across all LoRA-MoE layers.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, model: nn.Module) -> torch.Tensor:
+        """Compute expert diversity loss from model parameters.
+
+        Args:
+            model: The model (may be DDP/DP-wrapped) with LoRA-MoE modules.
+
+        Returns:
+            Scalar loss (mean pairwise cosine similarity across layers).
+            Returns ``0.0`` (without grad) if no LoRA-MoE modules are found.
+        """
+        from models.lora_moe import LoRAMoEConv2d, LoRAMoELinear, _get_backbone
+
+        backbone = _get_backbone(model)
+        device = next(model.parameters()).device
+        total_sim = torch.tensor(0.0, device=device)
+        num_layers = 0
+
+        for m in backbone.modules():
+            if isinstance(m, LoRAMoELinear):
+                deltas = []
+                for k in range(m.num_experts):
+                    delta = m.lora_ups[k].weight @ m.lora_downs[k].weight
+                    deltas.append(delta.flatten())
+                total_sim = total_sim + self._pairwise_cosine_mean(deltas)
+                num_layers += 1
+            elif isinstance(m, LoRAMoEConv2d):
+                deltas = []
+                for k in range(m.num_experts):
+                    delta = m.lora_Bs[k] @ m.lora_As[k]
+                    deltas.append(delta.flatten())
+                total_sim = total_sim + self._pairwise_cosine_mean(deltas)
+                num_layers += 1
+
+        if num_layers == 0:
+            return total_sim
+
+        return total_sim / num_layers
+
+    @staticmethod
+    def _pairwise_cosine_mean(deltas: list[torch.Tensor]) -> torch.Tensor:
+        """Mean pairwise cosine similarity among K flattened delta vectors."""
+        K = len(deltas)
+        if K < 2:
+            # No pairs to compare — return 0.0 (on the correct device,
+            # with grad so it participates in the autograd graph).
+            return deltas[0].new_zeros((), requires_grad=True) if deltas else torch.tensor(0.0)
+        stacked = torch.stack(deltas, dim=0)  # (K, D)
+        normed = F.normalize(stacked, dim=1)
+        sim_matrix = normed @ normed.t()  # (K, K)
+        mask = torch.triu(
+            torch.ones(K, K, device=sim_matrix.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        return sim_matrix[mask].mean()
+
+
 def build_criterion(args) -> nn.Module:
     """Build the training loss criterion from config flags.
 

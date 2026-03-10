@@ -483,6 +483,8 @@ def train_one_epoch(
     *,
     writer: SummaryWriter | None = None,
     ema_teacher: nn.Module | None = None,
+    diversity_loss_fn: nn.Module | None = None,
+    lambda_diversity: float = 0.0,
 ) -> dict:
     """Train for one epoch. Returns dict with 'loss' and 'accuracy'.
 
@@ -513,6 +515,8 @@ def train_one_epoch(
         }
     elif use_multi_view:
         sub_loss_meters = {k: AverageMeter() for k in ("ce", "supcon", "mvc")}
+    if diversity_loss_fn is not None:
+        sub_loss_meters["diversity"] = AverageMeter()
 
     # Iteration-level multi-scale setup
     ms_interval = getattr(args, "multiscale_interval", 0)
@@ -720,6 +724,12 @@ def train_one_epoch(
                     logits1, logits2, proj1, proj2, labels,
                 )
 
+                # Expert diversity regularization
+                if diversity_loss_fn is not None:
+                    div_loss = diversity_loss_fn(model)
+                    loss = loss + lambda_diversity * div_loss
+                    loss_components["diversity"] = div_loss.item()
+
             preds = logits1.argmax(dim=1)
             for k, v in loss_components.items():
                 sub_loss_meters[k].update(v, batch_size)
@@ -843,6 +853,15 @@ def train_one_epoch(
                     # LoRA-MoE returns (B, C) — standard CE loss
                     logits = model(images, moe_expert_masks=expert_masks)
                     loss = criterion(logits, labels)
+
+                    # Expert diversity regularization
+                    if diversity_loss_fn is not None:
+                        div_loss = diversity_loss_fn(model)
+                        loss = loss + lambda_diversity * div_loss
+                        sub_loss_meters["diversity"].update(
+                            div_loss.item(), batch_size,
+                        )
+
                     preds = logits.argmax(dim=1)
                 else:
                     logits = model(images)
@@ -1212,6 +1231,18 @@ def main():
             f"curriculum={getattr(args, 'ohsm_curriculum', False)}",
             args,
         )
+
+    # Expert diversity loss for LoRA-MoE
+    diversity_loss_fn = None
+    _lambda_diversity = getattr(args, "lambda_diversity", 0.0)
+    if _lambda_diversity > 0.0 and getattr(args, "lora_moe_enabled", False):
+        from losses import ExpertDiversityLoss
+
+        diversity_loss_fn = ExpertDiversityLoss()
+        print_rank0(
+            f"  Expert diversity loss: lambda={_lambda_diversity}", args,
+        )
+
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, steps_per_epoch)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -1362,6 +1393,8 @@ def main():
             scaler, device, epoch, args,
             writer=writer,
             ema_teacher=ema_teacher,
+            diversity_loss_fn=diversity_loss_fn,
+            lambda_diversity=_lambda_diversity,
         )
 
         if writer is not None:
