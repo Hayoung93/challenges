@@ -81,7 +81,10 @@ def build_dataset(name: str, args, split: str = "train",
                 getattr(args, "small_crop_range_min", 48),
                 getattr(args, "small_crop_range_max", 192),
             ),
-            moe_tracking=getattr(args, "moe_enabled", False),
+            moe_tracking=(
+                getattr(args, "moe_enabled", False)
+                or getattr(args, "lora_moe_enabled", False)
+            ),
         )
     else:
         transform = _get_inference_transform(args)
@@ -341,7 +344,10 @@ def build_train_val_loaders(
                 getattr(args, "small_crop_range_min", 48),
                 getattr(args, "small_crop_range_max", 192),
             ),
-            moe_tracking=getattr(args, "moe_enabled", False),
+            moe_tracking=(
+                getattr(args, "moe_enabled", False)
+                or getattr(args, "lora_moe_enabled", False)
+            ),
         )
         if isinstance(mv_result, tuple):
             shared_spatial, augment_only, to_tensor_norm = mv_result
