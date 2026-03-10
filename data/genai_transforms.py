@@ -50,6 +50,36 @@ def _iscale_lower(rng, intensity):
     return (b - (b - a) * intensity, b)
 
 
+def _beta_sample_lower(rng, intensity, skew=4.0):
+    """Sample from *rng* with beta-distribution bias toward the lower end.
+
+    Uses ``_iscale_lower`` to compute the effective range, then draws from
+    a beta distribution whose shape shifts with *intensity*:
+
+    * intensity ≈ 0  →  alpha high, beta low  →  samples cluster near **hi**
+    * intensity ≈ 1  →  alpha low,  beta high →  samples cluster near **lo**
+
+    This makes strong degradations (low quality) much more likely at high
+    intensity while still allowing occasional mild samples.
+
+    Args:
+        rng: ``(min_val, max_val)`` – the full parameter range.
+        intensity: float in [0, 1] from the curriculum.
+        skew: controls how strongly the distribution is biased (default 4.0).
+
+    Returns:
+        int – a sampled value in [lo, hi].
+    """
+    lo, hi = _iscale_lower(rng, intensity)
+    lo, hi = int(round(lo)), int(round(hi))
+    if lo >= hi:
+        return lo
+    alpha = 1.0 + (1.0 - intensity) * skew
+    beta_param = 1.0 + intensity * skew
+    t = random.betavariate(alpha, beta_param)
+    return int(round(lo + (hi - lo) * t))
+
+
 def _iscale_neutral(rng, intensity, neutral):
     """(a, b) symmetric around neutral point.
 
@@ -81,8 +111,7 @@ class RandomJPEGCompression:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        lo, hi = _iscale_lower(self.quality_range, self._intensity)
-        quality = random.randint(int(round(lo)), int(round(hi)))
+        quality = _beta_sample_lower(self.quality_range, self._intensity)
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=quality)
         buffer.seek(0)
@@ -1068,8 +1097,7 @@ class RandomWebPCompression:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        lo, hi = _iscale_lower(self.quality_range, self._intensity)
-        quality = random.randint(int(round(lo)), int(round(hi)))
+        quality = _beta_sample_lower(self.quality_range, self._intensity)
         buffer = io.BytesIO()
         img.save(buffer, format="WEBP", quality=quality)
         buffer.seek(0)
@@ -1106,8 +1134,7 @@ class RandomAVIFCompression:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p or not _AVIF_AVAILABLE:
             return img
-        lo, hi = _iscale_lower(self.quality_range, self._intensity)
-        quality = random.randint(int(round(lo)), int(round(hi)))
+        quality = _beta_sample_lower(self.quality_range, self._intensity)
         buffer = io.BytesIO()
         img.save(buffer, format="AVIF", quality=quality)
         buffer.seek(0)
