@@ -92,6 +92,54 @@ def _iscale_neutral(rng, intensity, neutral):
             neutral + (b - neutral) * intensity)
 
 
+def _beta_sample_neutral(rng, intensity, neutral=0.0, skew=3.0):
+    """Sample from *rng* with beta-distribution bias toward *neutral*.
+
+    Combines two gating mechanisms:
+
+    1. **Range narrowing** (via :func:`_iscale_neutral`): at low intensity
+       the effective ``[lo, hi]`` interval is collapsed toward *neutral*.
+    2. **Probability skewing**: within the effective range, a
+       ``Beta(1, β)`` distribution biases samples toward *neutral*.
+       ``β`` decreases as intensity grows, so extreme values become
+       progressively more reachable.
+
+    At ``intensity ≈ 0`` both gates are tight → samples ≈ *neutral*.
+    At ``intensity = 1`` the full range is available and the beta bias
+    is mild (``β = 1 + skew_floor``) — extreme values are possible but
+    still less likely than moderate ones.
+
+    Args:
+        rng: ``(min_val, max_val)`` – the full parameter range.
+        intensity: float in [0, 1] from the curriculum.
+        neutral: The neutral / identity point (e.g. 0.0 for brightness).
+        skew: controls how strongly the distribution is biased toward
+            *neutral* at low intensity (higher = more concentrated).
+
+    Returns:
+        float – a sampled value in ``[lo, hi]``.
+    """
+    lo, hi = _iscale_neutral(rng, intensity, neutral)
+    if abs(hi - lo) < 1e-8:
+        return neutral
+    above = hi - neutral
+    below = neutral - lo
+    total = above + below
+    if total < 1e-8:
+        return neutral
+    # Beta shape parameter: high at low intensity → peaked near neutral,
+    # mild floor (1.5) at full intensity so extremes remain rare.
+    beta_b = 1.5 + (1.0 - intensity) * skew
+    # Pick direction proportional to available range on each side,
+    # then sample distance from neutral via Beta(1, β).
+    if random.random() < above / total:
+        t = random.betavariate(1.0, beta_b)
+        return neutral + above * t
+    else:
+        t = random.betavariate(1.0, beta_b)
+        return neutral - below * t
+
+
 class RandomJPEGCompression:
     """Randomly compress image via JPEG at a random quality level.
 
@@ -984,16 +1032,23 @@ class RandomContrastCurve:
         p: Probability of applying this transform.
     """
 
-    def __init__(self, amount_range=(-0.4, 0.3), p=0.3):
+    def __init__(self, amount_range=(-0.4, 0.3), p=0.3, beta_skew=None):
         self.amount_range = amount_range
         self.p = p
+        self.beta_skew = beta_skew
         self._intensity = 1.0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
-        amount = random.uniform(lo, hi)
+        if self.beta_skew is not None:
+            amount = _beta_sample_neutral(
+                self.amount_range, self._intensity,
+                neutral=0.0, skew=self.beta_skew,
+            )
+        else:
+            lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
+            amount = random.uniform(lo, hi)
         x_pts = np.array([0.0, 0.3, 0.5, 0.7, 1.0])
         y_pts = np.array([
             0.0,
@@ -1010,7 +1065,8 @@ class RandomContrastCurve:
     def __repr__(self):
         return (
             f"{self.__class__.__name__}("
-            f"amount_range={self.amount_range}, p={self.p})"
+            f"amount_range={self.amount_range}, p={self.p}, "
+            f"beta_skew={self.beta_skew})"
         )
 
 
@@ -1027,9 +1083,10 @@ class RandomBrightnessCurve:
         p: Probability of applying this transform.
     """
 
-    def __init__(self, amount_range=(-0.4, 0.5), p=0.3):
+    def __init__(self, amount_range=(-0.4, 0.5), p=0.3, beta_skew=None):
         self.amount_range = amount_range
         self.p = p
+        self.beta_skew = beta_skew
         self._intensity = 1.0
 
     @staticmethod
@@ -1044,8 +1101,14 @@ class RandomBrightnessCurve:
     def __call__(self, img: Image.Image) -> Image.Image:
         if random.random() > self.p:
             return img
-        lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
-        amount = random.uniform(lo, hi)
+        if self.beta_skew is not None:
+            amount = _beta_sample_neutral(
+                self.amount_range, self._intensity,
+                neutral=0.0, skew=self.beta_skew,
+            )
+        else:
+            lo, hi = _iscale_neutral(self.amount_range, self._intensity, neutral=0.0)
+            amount = random.uniform(lo, hi)
         if amount >= 0:
             coef = 0.5 + amount / 2
         else:
@@ -1073,7 +1136,8 @@ class RandomBrightnessCurve:
     def __repr__(self):
         return (
             f"{self.__class__.__name__}("
-            f"amount_range={self.amount_range}, p={self.p})"
+            f"amount_range={self.amount_range}, p={self.p}, "
+            f"beta_skew={self.beta_skew})"
         )
 
 

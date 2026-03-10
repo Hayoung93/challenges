@@ -460,8 +460,8 @@ def _robust_artifact_groups_extended() -> dict:
         ],
         "sharpness_brightness": [
             RandomSharpen(factor_range=(1.0, 5.0), p=1.0),
-            RandomContrastCurve(amount_range=(-0.4, 0.3), p=1.0),
-            RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
+            RandomContrastCurve(amount_range=(-0.5, 0.5), beta_skew=3.0, p=1.0),
+            RandomBrightnessCurve(amount_range=(-0.5, 0.9), beta_skew=3.0, p=1.0),
         ],
         "dct_overlay": [
             RandomDCTBasisOverlay(p=1.0),
@@ -478,7 +478,7 @@ _ROBUST_GROUP_WEIGHTS = {
     "color": 0.4,
     "spatial": 0.5,
     "sharpness_brightness": 0.5,
-    "dct_overlay": 0.5,
+    "dct_overlay": 0.25,
     "moire": 0.5,
 }
 
