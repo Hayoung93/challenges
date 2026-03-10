@@ -1,6 +1,6 @@
 import multiprocessing
 import os
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -8,7 +8,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from .base import BaseGenAIDataset, MultiViewDataset
 from .dragon import DragonArrowDataset
-from .ntire import NTIREDataset, NTIRETestDataset
+from .ntire import DistortedValDataset, NTIREDataset, NTIRETestDataset
 from .transforms import (
     get_multi_view_transforms,
     get_train_transform,
@@ -123,8 +123,8 @@ def build_dataset(name: str, args, split: str = "train",
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
             curriculum_ratio=getattr(args, "curriculum_ratio", 0.5),
-            curriculum_n_min=getattr(args, "curriculum_n_min", 2),
-            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
+            curriculum_n_min=getattr(args, "curriculum_n_min", 1),
+            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 1),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
             small_pad_p=getattr(args, "small_pad_p", 0.0),
@@ -313,20 +313,51 @@ def build_dataloader(
         raise ValueError(f"Unknown dataset_mode: {dataset_mode}")
 
 
+def _build_distorted_val_loader(args) -> Optional[DataLoader]:
+    """Build a DataLoader for pre-generated distorted validation images.
+
+    Returns ``None`` when ``args.distorted_val_dir`` is empty or unset.
+    """
+    distorted_val_dir = getattr(args, "distorted_val_dir", "")
+    if not distorted_val_dir:
+        return None
+
+    transform = get_val_transform(
+        image_size=getattr(args, "image_size", 224),
+        resize_size=getattr(args, "resize_size", 256),
+    )
+    ds = DistortedValDataset(root=distorted_val_dir, transform=transform)
+    print(f"  [distorted_val] {len(ds):,} images from {distorted_val_dir}")
+
+    kw = _make_loader_kwargs(args, is_train=False)
+    if getattr(args, "distributed", False):
+        kw["sampler"] = torch.utils.data.distributed.DistributedSampler(
+            ds, shuffle=False
+        )
+    else:
+        kw["shuffle"] = False
+    return DataLoader(ds, **kw)
+
+
 def build_train_val_loaders(
     args,
 ) -> Tuple[
     Union[DataLoader, Dict[str, DataLoader]],
     Union[DataLoader, Dict[str, DataLoader]],
+    Optional[DataLoader],
 ]:
     """Build train and validation DataLoaders with a random split.
 
     Uses ``args.val_split_ratio`` to hold out a fraction of training data
     for validation.  The split is seeded by ``args.seed`` for reproducibility.
 
+    When ``args.distorted_val_dir`` is set to a non-empty path, an
+    additional :class:`DistortedValDataset` loader is built from
+    pre-generated distorted images (see ``scripts/generate_distorted_val.py``).
+
     Returns:
-        ``(train_loader, val_loader)`` — each follows the same
-        ``dataset_mode`` semantics as :func:`build_dataloader`.
+        ``(train_loader, val_loader, distorted_val_loader)`` — the third
+        element is ``None`` when distorted validation is disabled.
     """
     val_ratio: float = getattr(args, "val_split_ratio", 0.1)
     seed: int = getattr(args, "seed", 42)
@@ -386,8 +417,8 @@ def build_train_val_loaders(
             total_epochs=getattr(args, "epochs", 30),
             epoch_state=epoch_state,
             curriculum_ratio=getattr(args, "curriculum_ratio", 0.5),
-            curriculum_n_min=getattr(args, "curriculum_n_min", 2),
-            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 3),
+            curriculum_n_min=getattr(args, "curriculum_n_min", 1),
+            curriculum_n_max_start=getattr(args, "curriculum_n_max_start", 1),
             curriculum_n_max_end=getattr(args, "curriculum_n_max_end", 7),
             scale_state=scale_state,
             small_pad_p=small_pad_p,
@@ -468,7 +499,10 @@ def build_train_val_loaders(
             val_kw["shuffle"] = False
         val_loader = DataLoader(val_subset, **val_kw)
 
-        return train_loader, val_loader
+        # Distorted validation loader (pre-generated images)
+        distorted_val_loader = _build_distorted_val_loader(args)
+
+        return train_loader, val_loader, distorted_val_loader
 
     elif dataset_mode == "separate":
         train_loaders: Dict[str, DataLoader] = {}
@@ -526,7 +560,9 @@ def build_train_val_loaders(
                 val_kw["shuffle"] = False
             val_loaders[name] = DataLoader(val_sub, **val_kw)
 
-        return train_loaders, val_loaders
+        distorted_val_loader = _build_distorted_val_loader(args)
+
+        return train_loaders, val_loaders, distorted_val_loader
 
     else:
         raise ValueError(f"Unknown dataset_mode: {dataset_mode}")
