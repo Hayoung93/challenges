@@ -443,9 +443,10 @@ def _robust_artifact_groups_extended() -> dict:
             RandomPixelization(ratio_range=(0.2, 0.8), p=1.0),
         ],
         "color": [
-            RandomColorQuantization(levels_range=(7, 20), p=1.0),
-            RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0),
-            RandomPosterize(bits_range=(2, 6), p=1.0),
+            (RandomColorQuantization(levels_range=(7, 20), p=1.0), 1.0),
+            (RandomGammaCorrection(gamma_range=(0.5, 2.0), p=1.0), 1.0),
+            (RandomPosterize(bits_range=(2, 6), p=1.0), 1.0),
+            (T.RandomGrayscale(p=1.0), 0.2),
         ],
         "spatial": [
             RandomSpatialJitter(amount_range=(0.05, 0.5), p=1.0),
@@ -456,15 +457,23 @@ def _robust_artifact_groups_extended() -> dict:
             RandomContrastCurve(amount_range=(-0.4, 0.3), p=1.0),
             RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
         ],
+        "dct_overlay": [
+            RandomDCTBasisOverlay(p=1.0),
+        ],
+        "moire": [
+            RandomMoire(p=1.0),
+        ],
     }
 
 
 # Group sampling weights for robust pipelines.
 # Groups not listed default to 1.0 (uniform).
 _ROBUST_GROUP_WEIGHTS = {
-    "color": 0.25,
+    "color": 0.4,
     "spatial": 0.5,
     "sharpness_brightness": 0.5,
+    "dct_overlay": 0.5,
+    "moire": 0.5,
 }
 
 
@@ -723,8 +732,6 @@ def get_train_transform(
                               small_pad_p=small_pad_p,
                               small_crop_range=small_crop_range)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.08))]
-            + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
             + _to_tensor_normalize()
         )
         if moe_tracking:
@@ -895,12 +902,7 @@ def get_multi_view_transforms(
             clean_p_end=0.15,
             intensity_curriculum=True,
         )
-        augment_list = (
-            [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.08))]
-            + [SkipIfClean(artifact_compose, RandomMoire(p=0.08))]
-        )
-        augment_only = T.Compose(augment_list)
+        augment_only = T.Compose([artifact_compose])
         if moe_tracking:
             augment_only = TrackingTransformWrapper(
                 augment_only, group_source=artifact_compose,

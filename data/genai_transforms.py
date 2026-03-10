@@ -1765,8 +1765,15 @@ class GroupedNOfCompose:
     The actual number of groups selected each call is sampled uniformly
     from ``[1, n]``, adding intensity variance across images.
 
+    Each group value can be either:
+
+    - A plain list of transforms → uniform intra-group sampling.
+    - A list of ``(transform, weight)`` tuples → weighted intra-group
+      sampling.  Both forms can be mixed across groups.
+
     Args:
-        groups: Dict mapping group names to lists of transform instances.
+        groups: Dict mapping group names to lists of transform instances
+            or ``(transform, weight)`` tuples.
         n: Maximum number of groups to select per call.
         weights: Optional dict mapping group names to sampling weights.
             Groups not listed default to 1.0.  Higher weight = more
@@ -1779,8 +1786,16 @@ class GroupedNOfCompose:
     def __init__(self, groups: dict, n: int = 4,
                  weights: dict | None = None,
                  clean_p: float = 0.0):
-        self.groups = groups
-        self.group_names = list(groups.keys())
+        self.groups = {}
+        self._intra_weights = {}
+        for name, items in groups.items():
+            if items and isinstance(items[0], tuple):
+                self.groups[name] = [t for t, _w in items]
+                self._intra_weights[name] = [w for _t, w in items]
+            else:
+                self.groups[name] = items
+                self._intra_weights[name] = None
+        self.group_names = list(self.groups.keys())
         self.n = n
         self.clean_p = clean_p
         self._weights = (
@@ -1808,7 +1823,11 @@ class GroupedNOfCompose:
         self._last_groups = frozenset(selected_groups)
         transforms = []
         for group_name in selected_groups:
-            t = random.choice(self.groups[group_name])
+            iw = self._intra_weights[group_name]
+            if iw is not None:
+                t = random.choices(self.groups[group_name], weights=iw, k=1)[0]
+            else:
+                t = random.choice(self.groups[group_name])
             transforms.append(t)
         random.shuffle(transforms)
         for t in transforms:
@@ -1884,8 +1903,17 @@ class CurricularGroupedNOfCompose:
                  intensity_curriculum: bool = False,
                  # legacy compat
                  n_max=None, n_start=None):
-        self.groups = groups
-        self.group_names = list(groups.keys())
+        # Parse groups: separate transforms and optional intra-weights
+        self.groups = {}
+        self._intra_weights = {}
+        for name, items in groups.items():
+            if items and isinstance(items[0], tuple):
+                self.groups[name] = [t for t, _w in items]
+                self._intra_weights[name] = [w for _t, w in items]
+            else:
+                self.groups[name] = items
+                self._intra_weights[name] = None
+        self.group_names = list(self.groups.keys())
         self.epoch_state = epoch_state
         self.total_epochs = total_epochs
         self.curriculum_ratio = curriculum_ratio
@@ -1970,7 +1998,11 @@ class CurricularGroupedNOfCompose:
         self._last_groups = frozenset(selected_groups)
         transforms = []
         for group_name in selected_groups:
-            t = random.choice(self.groups[group_name])
+            iw = self._intra_weights[group_name]
+            if iw is not None:
+                t = random.choices(self.groups[group_name], weights=iw, k=1)[0]
+            else:
+                t = random.choice(self.groups[group_name])
             transforms.append(t)
         random.shuffle(transforms)
 
