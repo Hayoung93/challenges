@@ -1363,8 +1363,8 @@ def main():
                 args,
             )
 
-        # Set epoch on DistributedSampler for proper shuffling
-        if args.distributed and hasattr(train_loader, "sampler"):
+        # Set epoch on sampler (DistributedSampler or EpochFractionSampler)
+        if hasattr(train_loader, "sampler"):
             sampler = train_loader.sampler
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)

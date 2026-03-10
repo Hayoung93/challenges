@@ -14,6 +14,8 @@ DEFAULTS = {
 
     # Train/val split
     "val_split_ratio": 0.1,  # fraction of training data for validation
+    "train_sampling": False,       # enable training data sub-sampling
+    "train_sample_ratio": 0.1,    # fraction of training data per epoch (when enabled)
 
     # DataLoader
     "batch_size": 32,
@@ -181,6 +183,14 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Test subset: 1=val_images, 2=val_images_hard, 3=both")
     g.add_argument("--val_split_ratio", type=float, default=DEFAULTS["val_split_ratio"],
                     help="Fraction of training data to hold out for validation")
+    g.add_argument("--train_sampling", action="store_true",
+                    default=DEFAULTS["train_sampling"],
+                    help="Enable training data sub-sampling (use fraction of data per epoch)")
+    g.add_argument("--no_train_sampling", dest="train_sampling", action="store_false")
+    g.add_argument("--train_sample_ratio", type=float,
+                    default=DEFAULTS["train_sample_ratio"],
+                    help="Fraction of training data per epoch when --train_sampling "
+                         "is on (default: 0.1 = 10%%)")
     g.add_argument("--batch_size", type=int, default=DEFAULTS["batch_size"])
     g.add_argument("--num_workers", type=int, default=DEFAULTS["num_workers"])
     g.add_argument("--pin_memory", action="store_true", default=DEFAULTS["pin_memory"])
@@ -588,6 +598,13 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
                 f"--moe_enabled requires --augmentation robust/robust_curriculum/"
                 f"robust_curriculum_range, got '{aug}'"
             )
+    # Validate train_sample_ratio bounds.
+    ratio = getattr(args, "train_sample_ratio", 0.1)
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(
+            f"--train_sample_ratio must be in (0.0, 1.0], got {ratio}"
+        )
+
     # LoRA-MoE requires grouped augmentation (robust variants).
     if getattr(args, "lora_moe_enabled", False):
         aug = getattr(args, "augmentation", "default")

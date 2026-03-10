@@ -16,6 +16,57 @@ from .transforms import (
     get_val_transform,
 )
 
+class EpochFractionSampler(torch.utils.data.Sampler):
+    """Sample a random fraction of indices, re-shuffled every epoch.
+
+    Each call to :meth:`set_epoch` changes the random seed so that a
+    *different* subset of size ``int(len(indices) * ratio)`` is selected.
+    Compatible with ``DistributedSampler``-style epoch setting in training
+    loops.
+    """
+
+    def __init__(self, indices, ratio, seed=42, distributed=False,
+                 rank=0, world_size=1):
+        self.indices = list(indices)
+        self.ratio = ratio
+        self.seed = seed
+        self.epoch = 0
+        self.distributed = distributed
+        self.rank = rank
+        self.world_size = world_size
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _sampled_size(self):
+        return max(1, int(len(self.indices) * self.ratio))
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        perm = torch.randperm(len(self.indices), generator=g).tolist()
+        sampled_size = self._sampled_size()
+        sampled = [self.indices[i] for i in perm[:sampled_size]]
+        if self.distributed:
+            # Pad to make evenly divisible (matches DistributedSampler)
+            per_rank = (sampled_size + self.world_size - 1) // self.world_size
+            padded_size = per_rank * self.world_size
+            if len(sampled) < padded_size:
+                sampled += sampled[:padded_size - len(sampled)]
+            sampled = sampled[self.rank::self.world_size]
+        # Shuffle order within the selected subset
+        g2 = torch.Generator()
+        g2.manual_seed(self.seed + self.epoch + 1000)
+        order = torch.randperm(len(sampled), generator=g2).tolist()
+        return iter([sampled[i] for i in order])
+
+    def __len__(self):
+        total = self._sampled_size()
+        if self.distributed:
+            return (total + self.world_size - 1) // self.world_size
+        return total
+
+
 def _get_inference_transform(args):
     """Select the appropriate transform for inference/validation.
 
@@ -363,6 +414,9 @@ def build_train_val_loaders(
             )
         print("  [multi_view] Enabled: shared spatial + augmented/clean views")
 
+    train_sampling = getattr(args, "train_sampling", False)
+    sample_ratio: float = getattr(args, "train_sample_ratio", 0.1)
+
     if dataset_mode == "concat":
         combined_train = ConcatDataset(list(train_transform_datasets.values()))
         combined_val = ConcatDataset(list(val_transform_datasets.values()))
@@ -380,7 +434,22 @@ def build_train_val_loaders(
         val_subset = torch.utils.data.Subset(combined_val, val_indices)
 
         train_kw = _make_loader_kwargs(args, is_train=True)
-        if getattr(args, "distributed", False):
+        if train_sampling and sample_ratio < 1.0:
+            distributed = getattr(args, "distributed", False)
+            rank = 0
+            ws = 1
+            if distributed:
+                import torch.distributed as dist
+                rank = dist.get_rank()
+                ws = dist.get_world_size()
+            train_kw["sampler"] = EpochFractionSampler(
+                range(len(train_subset)), sample_ratio, seed=seed,
+                distributed=distributed, rank=rank, world_size=ws,
+            )
+            per_epoch = max(1, int(len(train_subset) * sample_ratio))
+            print(f"  [sampling] {sample_ratio*100:.0f}% of train data per epoch "
+                  f"(~{per_epoch:,} samples, changes each epoch)")
+        elif getattr(args, "distributed", False):
             train_kw["sampler"] = torch.utils.data.distributed.DistributedSampler(
                 train_subset, shuffle=True
             )
@@ -422,7 +491,22 @@ def build_train_val_loaders(
             val_sub = torch.utils.data.Subset(ds_val, val_indices)
 
             train_kw = _make_loader_kwargs(args, is_train=True)
-            if getattr(args, "distributed", False):
+            if train_sampling and sample_ratio < 1.0:
+                distributed = getattr(args, "distributed", False)
+                rank = 0
+                ws = 1
+                if distributed:
+                    import torch.distributed as dist
+                    rank = dist.get_rank()
+                    ws = dist.get_world_size()
+                train_kw["sampler"] = EpochFractionSampler(
+                    range(len(train_sub)), sample_ratio, seed=seed,
+                    distributed=distributed, rank=rank, world_size=ws,
+                )
+                per_epoch = max(1, int(len(train_sub) * sample_ratio))
+                print(f"  [sampling] {name}: {sample_ratio*100:.0f}% per epoch "
+                      f"(~{per_epoch:,} samples, changes each epoch)")
+            elif getattr(args, "distributed", False):
                 train_kw["sampler"] = torch.utils.data.distributed.DistributedSampler(
                     train_sub, shuffle=True
                 )
