@@ -175,6 +175,112 @@ def _wrap_mamba_fp32(model: nn.Module) -> None:
         print(f"  Wrapped {patched} MambaVisionMixer layer(s) to fp32")
 
 
+def _vram_precheck_forward_backward(
+    model: nn.Module,
+    batch_size: int,
+    image_size: int,
+    device: torch.device,
+    amp: bool,
+    *,
+    use_lora_moe: bool = False,
+    use_multi_view: bool = False,
+    use_ema: bool = False,
+    ema_teacher: nn.Module | None = None,
+) -> None:
+    """Run a realistic forward + backward pass to measure peak VRAM.
+
+    Raises ``torch.cuda.OutOfMemoryError`` if the GPU cannot fit the
+    requested configuration.  The caller is responsible for cleanup.
+    """
+    dummy_v1 = torch.randn(batch_size, 3, image_size, image_size, device=device)
+    dummy_labels = torch.randint(0, 2, (batch_size,), device=device)
+    dummy_v2 = (
+        torch.randn(batch_size, 3, image_size, image_size, device=device)
+        if use_multi_view
+        else None
+    )
+
+    model.train()
+    with autocast(device_type="cuda", enabled=amp):
+        if use_lora_moe:
+            from models.lora_moe import clear_lora_moe_state
+            from models.moe import NUM_EXPERTS
+
+            # Worst case: all K experts active for every sample
+            expert_masks = torch.ones(
+                batch_size, NUM_EXPERTS, device=device, dtype=torch.float32,
+            )
+            if use_multi_view:
+                logits1, _, proj1 = model(
+                    dummy_v1, return_embedding=True,
+                    moe_expert_masks=expert_masks,
+                )
+                if ema_teacher is not None:
+                    with torch.no_grad():
+                        logits2, _, proj2 = ema_teacher(
+                            dummy_v2, return_embedding=True,
+                            moe_expert_masks=expert_masks,
+                        )
+                else:
+                    logits2, _, proj2 = model(
+                        dummy_v2, return_embedding=True,
+                        moe_expert_masks=expert_masks,
+                    )
+                clear_lora_moe_state(model)
+                if ema_teacher is not None:
+                    clear_lora_moe_state(ema_teacher)
+                from losses import MultiViewCriterion
+                crit = MultiViewCriterion(mvc_ema=use_ema)
+                loss, _ = crit(logits1, logits2, proj1, proj2, dummy_labels)
+            else:
+                logits = model(dummy_v1, moe_expert_masks=expert_masks)
+                clear_lora_moe_state(model)
+                loss = nn.functional.cross_entropy(logits, dummy_labels)
+
+        elif use_multi_view:
+            logits1, _, proj1 = model(dummy_v1, return_embedding=True)
+            if ema_teacher is not None:
+                with torch.no_grad():
+                    logits2, _, proj2 = ema_teacher(
+                        dummy_v2, return_embedding=True,
+                    )
+            else:
+                logits2, _, proj2 = model(dummy_v2, return_embedding=True)
+            from losses import MultiViewCriterion
+            crit = MultiViewCriterion(mvc_ema=use_ema)
+            loss, _ = crit(logits1, logits2, proj1, proj2, dummy_labels)
+
+        else:
+            logits = model(dummy_v1)
+            loss = nn.functional.cross_entropy(logits, dummy_labels)
+
+    # Backward to trigger gradient + activation memory
+    scaler = GradScaler("cuda", enabled=amp)
+    scaler.scale(loss).backward()
+
+
+def _vram_precheck_cleanup(
+    model: nn.Module,
+    was_training: bool,
+    ema_teacher: nn.Module | None = None,
+    optimizer_shadow: list | None = None,
+    use_lora_moe: bool = False,
+) -> None:
+    """Free all GPU memory allocated during the VRAM pre-check."""
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+    if use_lora_moe:
+        from models.lora_moe import clear_lora_moe_state
+        clear_lora_moe_state(model)
+        if ema_teacher is not None:
+            clear_lora_moe_state(ema_teacher)
+    if ema_teacher is not None:
+        del ema_teacher
+    if optimizer_shadow:
+        del optimizer_shadow[:]
+    torch.cuda.empty_cache()
+
+
 def vram_precheck(
     model: nn.Module,
     image_size: int,
@@ -183,106 +289,168 @@ def vram_precheck(
     amp: bool = True,
     args=None,
 ) -> None:
-    """Run a dummy forward pass to verify VRAM is sufficient.
+    """Run a realistic forward + backward pass to verify VRAM is sufficient.
 
-    Uses the largest resolution from the multi-scale pool to ensure
-    training won't OOM mid-epoch.  If the check fails, prints a
-    diagnostic message with suggested batch sizes and exits.
+    Simulates actual training memory usage by considering all active
+    options: LoRA-MoE (all K experts), multi-view (2 views), EMA
+    teacher (model deep-copy), optimizer states (AdamW exp_avg +
+    exp_avg_sq), and CutMix temporaries.
 
-    Note: This check uses inference mode (no gradients) so actual
-    training VRAM usage will be higher due to gradient and optimizer
-    state memory.
+    If the check fails, prints a diagnostic message with suggested
+    batch sizes and exits.
     """
     if device.type != "cuda":
         return
 
+    # ── Detect active features ──
+    _use_lora_moe = args is not None and getattr(args, "lora_moe_enabled", False)
+    _use_multi_view = args is not None and getattr(args, "multi_view", False)
+    _use_ema = _use_multi_view and args is not None and getattr(args, "mvc_ema", False)
+    _use_cutmix = (
+        args is not None
+        and getattr(args, "cutmix_p", 0.0) > 0.0
+    )
+
+    features_str = []
+    if _use_lora_moe:
+        features_str.append("LoRA-MoE")
+    if _use_multi_view:
+        features_str.append("multi-view")
+    if _use_ema:
+        features_str.append("EMA-teacher")
+    if _use_cutmix:
+        features_str.append("CutMix")
+    feature_tag = f" [{', '.join(features_str)}]" if features_str else ""
+
     print_rank0(
         f"  VRAM pre-check: batch_size={batch_size}, "
-        f"image_size={image_size}x{image_size} ...",
+        f"image_size={image_size}x{image_size}{feature_tag} ...",
         args,
     )
 
     from models.classifier import update_mambavision_window_size
     update_mambavision_window_size(model, image_size)
 
-    dummy_input = torch.randn(
-        batch_size, 3, image_size, image_size, device=device,
-    )
-    dummy_labels = torch.zeros(batch_size, dtype=torch.long, device=device)
-    criterion_check = nn.CrossEntropyLoss()
-
-    # LoRA-MoE: use single expert for VRAM check to avoid K× forward.
-    # We bypass the classifier's forward (which loops over all experts)
-    # and directly test a single-expert forward pass.
-    _lora_moe_active = False
-    if args is not None and getattr(args, "lora_moe_enabled", False):
-        _lora_moe_active = True
+    was_training = model.training
+    temp_ema_teacher = None
+    optimizer_shadow: list[torch.Tensor] = []
+    cutmix_tensors: list[torch.Tensor] = []
 
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            with autocast(device_type="cuda", enabled=amp):
-                if _lora_moe_active:
-                    from models.lora_moe import (
-                        clear_lora_moe_state,
-                        set_active_expert,
-                    )
-                    raw = model.module if hasattr(model, "module") else model
-                    set_active_expert(model, 0)
-                    features = raw._extract_features(dummy_input)
-                    logits = raw.backbone.head(features)
-                    clear_lora_moe_state(model)
-                else:
-                    logits = model(dummy_input)
-                _ = criterion_check(logits, dummy_labels)
-        model.train(was_training)
+        # 1. CutMix temporaries: bool mask + input clone(s)
+        if _use_cutmix:
+            cutmix_tensors.append(
+                torch.ones(batch_size, 1, image_size, image_size,
+                           dtype=torch.bool, device=device)
+            )
+            cutmix_tensors.append(
+                torch.randn(batch_size, 3, image_size, image_size, device=device)
+            )
+            if _use_multi_view:
+                cutmix_tensors.append(
+                    torch.randn(batch_size, 3, image_size, image_size, device=device)
+                )
 
-        del dummy_input, dummy_labels, logits
-        torch.cuda.empty_cache()
-        print_rank0("  VRAM pre-check: PASSED", args)
+        # 2. EMA teacher: deep-copy of model (parameters on GPU)
+        if _use_ema:
+            import copy
+            raw = model.module if hasattr(model, "module") else model
+            temp_ema_teacher = copy.deepcopy(raw)
+            for p in temp_ema_teacher.parameters():
+                p.requires_grad = False
+            temp_ema_teacher.eval()
+
+        # 3. Optimizer states: 2 tensors per trainable param (AdamW)
+        for p in model.parameters():
+            if p.requires_grad:
+                optimizer_shadow.append(torch.zeros_like(p))  # exp_avg
+                optimizer_shadow.append(torch.zeros_like(p))  # exp_avg_sq
+
+        # 4. Forward + backward (the main memory test)
+        _vram_precheck_forward_backward(
+            model, batch_size, image_size, device, amp,
+            use_lora_moe=_use_lora_moe,
+            use_multi_view=_use_multi_view,
+            use_ema=_use_ema,
+            ema_teacher=temp_ema_teacher,
+        )
+
+        # ── Success ──
+        peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+        total_mb = torch.cuda.get_device_properties(device).total_memory / (1024**2)
+        _vram_precheck_cleanup(
+            model, was_training, temp_ema_teacher, optimizer_shadow,
+            use_lora_moe=_use_lora_moe,
+        )
+        del cutmix_tensors
+        torch.cuda.reset_peak_memory_stats(device)
+        print_rank0(
+            f"  VRAM pre-check: PASSED "
+            f"(peak {peak_mb / 1024:.1f} / {total_mb / 1024:.1f} GB)",
+            args,
+        )
 
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        if _lora_moe_active:
-            from models.lora_moe import clear_lora_moe_state
-            clear_lora_moe_state(model)
+        # ── Cleanup from failed attempt ──
+        _vram_precheck_cleanup(
+            model, was_training, temp_ema_teacher, optimizer_shadow,
+            use_lora_moe=_use_lora_moe,
+        )
+        del cutmix_tensors
+        temp_ema_teacher = None
 
+        # ── Probe for a working batch size ──
         suggested = None
         for try_bs in [batch_size // 2, batch_size // 4, batch_size // 8]:
             if try_bs < 1:
                 break
             try:
-                dummy = torch.randn(
-                    try_bs, 3, image_size, image_size, device=device,
+                _vram_precheck_forward_backward(
+                    model, try_bs, image_size, device, amp,
+                    use_lora_moe=_use_lora_moe,
+                    use_multi_view=_use_multi_view,
+                    use_ema=False,
+                    ema_teacher=None,
                 )
-                model.eval()
-                with torch.no_grad():
-                    with autocast(device_type="cuda", enabled=amp):
-                        out = model(dummy)
-                del dummy, out
+                model.zero_grad(set_to_none=True)
+                if _use_lora_moe:
+                    from models.lora_moe import clear_lora_moe_state
+                    clear_lora_moe_state(model)
                 torch.cuda.empty_cache()
                 suggested = try_bs
                 break
             except torch.cuda.OutOfMemoryError:
+                model.zero_grad(set_to_none=True)
+                if _use_lora_moe:
+                    from models.lora_moe import clear_lora_moe_state
+                    clear_lora_moe_state(model)
                 torch.cuda.empty_cache()
                 continue
 
-        vram_total = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        model.train(was_training)
+        vram_total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
         msg = (
             f"\n  VRAM pre-check: FAILED\n"
             f"  GPU: {torch.cuda.get_device_name(device)} ({vram_total:.1f} GB)\n"
             f"  Requested: batch_size={batch_size}, "
             f"image_size={image_size}x{image_size}\n"
         )
+        if _use_lora_moe:
+            from models.moe import NUM_EXPERTS
+            msg += f"  Mode: LoRA-MoE (K={NUM_EXPERTS} experts)\n"
+        if _use_multi_view:
+            msg += f"  Mode: multi-view (2 views)\n"
+        if _use_ema:
+            msg += f"  Mode: EMA teacher (deep copy on GPU)\n"
         if suggested:
             msg += f"  Suggested: --batch_size {suggested}\n"
         else:
             msg += (
                 f"  Even batch_size=1 failed. Consider:\n"
-                f"    - Removing {image_size} from --multiscale_sizes\n"
+                f"    - Using a smaller --image_size\n"
                 f"    - Using a smaller model\n"
                 f"    - Enabling --amp\n"
+                f"    - Disabling --multi_view or --mvc_ema\n"
             )
         print(msg)
         raise SystemExit(1)
@@ -1161,10 +1329,12 @@ def main():
         _, _, lora_moe_params = count_lora_moe_params(raw_model)
         print_rank0(f"  LoRA-MoE expert params: {lora_moe_params:,}", args)
 
-    # VRAM pre-check (multi-scale: verify largest resolution fits in VRAM)
-    if getattr(args, "multiscale", False) and device.type == "cuda":
-        max_size = max(args.multiscale_sizes)
-        vram_precheck(model, max_size, args.batch_size, device, args.amp, args)
+    # VRAM pre-check: simulate actual training memory with all active options
+    if device.type == "cuda":
+        check_size = args.image_size
+        if getattr(args, "multiscale", False):
+            check_size = max(args.multiscale_sizes)
+        vram_precheck(model, check_size, args.batch_size, device, args.amp, args)
 
     # Linear LR scaling (before optimizer build)
     if args.distributed and getattr(args, "scale_lr", False):
