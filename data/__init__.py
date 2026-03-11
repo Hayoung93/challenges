@@ -577,9 +577,11 @@ def build_test_dataloader(
         1 → single DataLoader for ``val_images``
         2 → single DataLoader for ``val_images_hard``
         3 → ``dict[str, DataLoader]`` keyed by subset name
+        4 → single DataLoader for ``public_test``
+        5 → dict of all three (val_images, val_images_hard, public_test)
 
     Returns:
-        A single DataLoader (modes 1 & 2) or dict of DataLoaders (mode 3).
+        A single DataLoader (modes 1, 2, 4) or dict of DataLoaders (modes 3, 5).
     """
     ntire_root = getattr(args, "ntire_root", "/data/data/NTIRE2026_GenAI")
     test_root = os.path.join(ntire_root, "test")
@@ -591,26 +593,40 @@ def build_test_dataloader(
         1: ["val_images"],
         2: ["val_images_hard"],
         3: ["val_images", "val_images_hard"],
+        4: ["public_test"],
+        5: ["val_images", "val_images_hard", "public_test"],
     }
     if test_mode not in _MODE_SUBSETS:
         raise ValueError(
-            f"Invalid ntire_test_mode={test_mode}. Must be 1, 2, or 3."
+            f"Invalid ntire_test_mode={test_mode}. Must be 1, 2, 3, 4, or 5."
         )
+
+    def _subset_root(subset_name: str) -> str:
+        """Resolve the parent directory for a given subset.
+
+        ``val_images`` and ``val_images_hard`` live under ``{ntire_root}/test/``,
+        while ``public_test`` lives directly under ``{ntire_root}/``.
+        """
+        if subset_name == "public_test":
+            return ntire_root
+        return test_root
 
     loader_kwargs = _make_loader_kwargs(args, is_train=False)
     loader_kwargs["shuffle"] = False
 
-    if test_mode in (1, 2):
+    if test_mode in (1, 2, 4):
         subsets = _MODE_SUBSETS[test_mode]
-        ds = NTIRETestDataset(root=test_root, subsets=subsets, transform=transform)
+        root = _subset_root(subsets[0])
+        ds = NTIRETestDataset(root=root, subsets=subsets, transform=transform)
         print(f"  [test] {subsets[0]}: {len(ds):,} samples")
         return DataLoader(ds, **loader_kwargs)
 
-    else:  # mode 3
+    else:  # mode 3 or 5
         loaders: Dict[str, DataLoader] = {}
-        for subset_name in _MODE_SUBSETS[3]:
+        for subset_name in _MODE_SUBSETS[test_mode]:
+            root = _subset_root(subset_name)
             ds = NTIRETestDataset(
-                root=test_root, subsets=[subset_name], transform=transform
+                root=root, subsets=[subset_name], transform=transform
             )
             print(f"  [test] {subset_name}: {len(ds):,} samples")
             loaders[subset_name] = DataLoader(ds, **dict(loader_kwargs))
