@@ -430,7 +430,7 @@ def main():
         preds = run_inference(model, test_loader, device, args.amp,
                               tta_mode=args.tta, image_size=args.image_size,
                               **mc_kwargs)
-        mode_names = {1: "val_images", 2: "val_images_hard"}
+        mode_names = {1: "val_images", 2: "val_images_hard", 4: "public_test"}
         subset_name = mode_names.get(args.ntire_test_mode, "test")
         csv_path = os.path.join(args.output_dir, f"predictions_{subset_name}.csv")
         generate_csv(preds, csv_path)

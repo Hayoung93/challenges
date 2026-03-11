@@ -10,7 +10,7 @@ DEFAULTS = {
     "dragon_root": "/data/data/dragon_dataset_regular",
     "ntire_root": "/data/data/NTIRE2026_GenAI",
     "ntire_shards": None,  # None = auto-discover all shards
-    "ntire_test_mode": 1,  # 1=val_images, 2=val_images_hard, 3=both
+    "ntire_test_mode": 1,  # 1=val_images, 2=val_images_hard, 3=both, 4=public_test, 5=all
 
     # Train/val split
     "val_split_ratio": 0.1,  # fraction of training data for validation
@@ -182,8 +182,9 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--ntire_shards", nargs="+", type=int, default=DEFAULTS["ntire_shards"],
                     help="Shard indices to load (default: all)")
     g.add_argument("--ntire_test_mode", type=int, default=DEFAULTS["ntire_test_mode"],
-                    choices=[1, 2, 3],
-                    help="Test subset: 1=val_images, 2=val_images_hard, 3=both")
+                    choices=[1, 2, 3, 4, 5],
+                    help="Test subset: 1=val_images, 2=val_images_hard, 3=both, "
+                         "4=public_test, 5=all (val_images+val_images_hard+public_test)")
     g.add_argument("--val_split_ratio", type=float, default=DEFAULTS["val_split_ratio"],
                     help="Fraction of training data to hold out for validation")
     g.add_argument("--distorted_val_dir", type=str,
