@@ -225,20 +225,23 @@ def _strong_geometric(image_size: int) -> list:
 
 def _genai_geometric(image_size: int, crop_p: float = 0.5,
                      small_pad_p: float = 0.0,
-                     small_crop_range: tuple = (48, 192)) -> list:
+                     small_crop_range: tuple = (48, 192),
+                     small_pad_mode: str = "zero",
+                     small_pad_interpolation: str = "random") -> list:
     """Geometric + color augmentations for genai pipelines.
 
     Uses ``RandomResizeOrCrop`` instead of ``RandomResizedCrop`` to
     preserve pixel-level artifacts that are critical for GenAI detection.
 
     When ``small_pad_p > 0``, uses :class:`ResizeOrCropWithSmallPad`
-    to randomly simulate very small test images that are reflect-padded
-    to ``image_size``.
+    to randomly simulate very small test images padded to ``image_size``.
     """
     if small_pad_p > 0:
         first_transform = ResizeOrCropWithSmallPad(
             image_size, crop_p=crop_p, scale=(0.5, 1.0),
             small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+            small_pad_mode=small_pad_mode,
+            small_pad_interpolation=small_pad_interpolation,
         )
     else:
         first_transform = RandomResizeOrCrop(
@@ -257,7 +260,9 @@ def _genai_geometric(image_size: int, crop_p: float = 0.5,
 
 def _genai_spatial(image_size: int, crop_p: float = 0.5,
                    small_pad_p: float = 0.0,
-                   small_crop_range: tuple = (48, 192)) -> list:
+                   small_crop_range: tuple = (48, 192),
+                   small_pad_mode: str = "zero",
+                   small_pad_interpolation: str = "random") -> list:
     """Spatial-only subset of :func:`_genai_geometric`.
 
     Returns crop, flip, and rotation transforms without any appearance
@@ -269,6 +274,8 @@ def _genai_spatial(image_size: int, crop_p: float = 0.5,
         first_transform = ResizeOrCropWithSmallPad(
             image_size, crop_p=crop_p, scale=(0.5, 1.0),
             small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+            small_pad_mode=small_pad_mode,
+            small_pad_interpolation=small_pad_interpolation,
         )
     else:
         first_transform = RandomResizeOrCrop(
@@ -322,7 +329,10 @@ def _augly_artifact_pool() -> list:
 
 def _robust_geometric(image_size: int, crop_p: float = 0.5,
                       small_pad_p: float = 0.0,
-                      small_crop_range: tuple = (48, 192)) -> list:
+                      small_crop_range: tuple = (48, 192),
+                      resize_mode: str = "resize_or_crop",
+                      small_pad_mode: str = "zero",
+                      small_pad_interpolation: str = "random") -> list:
     """Geometric augmentations for robust pipelines.
 
     Only spatial transforms (resize/crop, flip) that must always run to
@@ -332,20 +342,31 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
     pass-through gate and intensity curriculum scheduling.
 
     When ``small_pad_p > 0``, uses :class:`ResizeOrCropWithSmallPad`
-    to randomly simulate very small test images that are reflect-padded
-    to ``image_size``.
+    to randomly simulate very small test images padded to ``image_size``.
 
     Args:
         image_size: Target square output size.
         crop_p: Probability of pixel-preserving crop path.
-        small_pad_p: Probability of small-crop+reflect-pad path
+        small_pad_p: Probability of small-crop+pad path
             (0.0 = disabled).
         small_crop_range: ``(min, max)`` pixel range for small crops.
+        resize_mode: ``"resize_or_crop"`` uses :class:`RandomResizeOrCrop`
+            (pixel-preserving crop path); ``"resize"`` uses
+            ``Resize`` + ``CenterCrop`` (deterministic sizing).
+        small_pad_mode: ``"zero"``, ``"reflect"``, or ``"resize"``.
+        small_pad_interpolation: Interpolation for ``"resize"`` mode.
     """
-    if small_pad_p > 0:
+    if resize_mode == "resize":
+        first_transform = T.Compose([
+            T.Resize(image_size),
+            T.CenterCrop(image_size),
+        ])
+    elif small_pad_p > 0:
         first_transform = ResizeOrCropWithSmallPad(
             image_size, crop_p=crop_p, scale=(0.5, 1.0),
             small_pad_p=small_pad_p, small_crop_range=small_crop_range,
+            small_pad_mode=small_pad_mode,
+            small_pad_interpolation=small_pad_interpolation,
         )
     else:
         first_transform = RandomResizeOrCrop(
@@ -429,7 +450,7 @@ def _robust_artifact_groups_extended() -> dict:
             RandomBoxBlur(radius_range=(1, 5), p=1.0),
         ],
         "compression": [
-            RandomJPEGCompression(quality_range=(10, 95), p=1.0),
+            RandomJPEGCompression(quality_range=(5, 95), p=1.0),
             RandomWebPCompression(quality_range=(10, 95), p=1.0),
             RandomPNGReencode(p=1.0),
             RandomAVIFCompression(quality_range=(10, 95), p=1.0),
@@ -463,9 +484,6 @@ def _robust_artifact_groups_extended() -> dict:
             RandomContrastCurve(amount_range=(-0.5, 0.5), beta_skew=3.0, p=1.0),
             RandomBrightnessCurve(amount_range=(-0.5, 0.9), beta_skew=3.0, p=1.0),
         ],
-        "dct_overlay": [
-            RandomDCTBasisOverlay(p=1.0),
-        ],
         "moire": [
             RandomMoire(p=1.0),
         ],
@@ -478,7 +496,6 @@ _ROBUST_GROUP_WEIGHTS = {
     "color": 0.4,
     "spatial": 0.5,
     "sharpness_brightness": 0.5,
-    "dct_overlay": 0.25,
     "moire": 0.5,
 }
 
@@ -504,7 +521,10 @@ def get_train_transform(
     clean_view: bool = False,
     small_pad_p: float = 0.0,
     small_crop_range: tuple = (48, 192),
+    small_pad_mode: str = "zero",
+    small_pad_interpolation: str = "random",
     moe_tracking: bool = False,
+    robust_resize_mode: str = "resize_or_crop",
 ) -> Callable:
     """Build training transform pipeline.
 
@@ -529,12 +549,16 @@ def get_train_transform(
         clean_view: When ``True``, returns the geometric-only variant
             of the requested augmentation (no artifact transforms).
             Used by multi-view training to provide a clean anchor view.
-        small_pad_p: Probability of small-crop+reflect-pad augmentation
+        small_pad_p: Probability of small-crop+pad augmentation
             (0.0 = disabled).  Simulates very small test images.
         small_crop_range: ``(min, max)`` pixel range for small crops.
+        small_pad_mode: ``"zero"`` (constant 0) or ``"reflect"``.
         moe_tracking: When ``True``, wraps the returned pipeline in a
             :class:`TrackingTransformWrapper` that captures which
             augmentation groups were applied (for MoE training).
+        robust_resize_mode: ``"resize_or_crop"`` uses
+            :class:`RandomResizeOrCrop`; ``"resize"`` uses
+            ``Resize`` + ``CenterCrop``.  Only affects robust variants.
     """
     # Multi-scale: wrap with dynamic resolution dispatch
     if scale_state is not None:
@@ -552,7 +576,10 @@ def get_train_transform(
                 clean_view=clean_view,
                 small_pad_p=small_pad_p,
                 small_crop_range=small_crop_range,
+                small_pad_mode=small_pad_mode,
+                small_pad_interpolation=small_pad_interpolation,
                 moe_tracking=moe_tracking,
+                robust_resize_mode=robust_resize_mode,
             )
         return MultiscaleTransformWrapper(_build_for_size, scale_state, image_size)
 
@@ -574,8 +601,11 @@ def get_train_transform(
         geo_fn = _GEOMETRIC_MAP.get(augmentation)
         if geo_fn is not None:
             # Clean view: no small-pad simulation (anchor must be stable)
+            kwargs = {"small_pad_p": 0.0}
+            if geo_fn is _robust_geometric:
+                kwargs["resize_mode"] = robust_resize_mode
             geo_list = [
-                t for t in geo_fn(image_size, small_pad_p=0.0)
+                t for t in geo_fn(image_size, **kwargs)
                 if not isinstance(t, T.ColorJitter)
             ]
             return T.Compose(geo_list + _to_tensor_normalize())
@@ -604,7 +634,9 @@ def get_train_transform(
     elif augmentation == "genai":
         return T.Compose(
             _genai_geometric(image_size, small_pad_p=small_pad_p,
-                             small_crop_range=small_crop_range)
+                             small_crop_range=small_crop_range,
+                             small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [
                 RandomJPEGCompression(quality_range=(30, 95), p=0.5),
                 RandomDownscaleUpscale(scale_range=(0.5, 0.9), p=0.3),
@@ -643,14 +675,18 @@ def get_train_transform(
         )
         return T.Compose(
             _genai_geometric(image_size, small_pad_p=small_pad_p,
-                             small_crop_range=small_crop_range)
+                             small_crop_range=small_crop_range,
+                             small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [curricular, sp_curricular]
             + _to_tensor_normalize()
         )
     elif augmentation == "augly":
         return T.Compose(
             _genai_geometric(image_size, small_pad_p=small_pad_p,
-                             small_crop_range=small_crop_range)
+                             small_crop_range=small_crop_range,
+                             small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [RandomNOfCompose(_augly_artifact_pool(), n=5)]
             + _to_tensor_normalize()
         )
@@ -660,7 +696,9 @@ def get_train_transform(
             epoch_state = multiprocessing.Value("i", 0)
         return T.Compose(
             _genai_geometric(image_size, small_pad_p=small_pad_p,
-                             small_crop_range=small_crop_range)
+                             small_crop_range=small_crop_range,
+                             small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [
                 CurricularNOfCompose(
                     _augly_artifact_pool(),
@@ -675,15 +713,16 @@ def get_train_transform(
         )
     elif augmentation == "robust":
         artifact_compose = GroupedNOfCompose(
-            _robust_artifact_groups(), n=4,
-            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
+            _robust_artifact_groups_extended(), n=7,
+            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.15,
         )
         pipeline = T.Compose(
             _robust_geometric(image_size, small_pad_p=small_pad_p,
-                              small_crop_range=small_crop_range)
+                              small_crop_range=small_crop_range,
+                              resize_mode=robust_resize_mode,
+                              small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
-            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
         if moe_tracking:
@@ -707,7 +746,10 @@ def get_train_transform(
         )
         pipeline = T.Compose(
             _robust_geometric(image_size, small_pad_p=small_pad_p,
-                              small_crop_range=small_crop_range)
+                              small_crop_range=small_crop_range,
+                              resize_mode=robust_resize_mode,
+                              small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [artifact_compose]
             + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
@@ -736,7 +778,10 @@ def get_train_transform(
         pipeline = T.Compose(
             _robust_geometric(image_size,
                               small_pad_p=small_pad_p,
-                              small_crop_range=small_crop_range)
+                              small_crop_range=small_crop_range,
+                              resize_mode=robust_resize_mode,
+                              small_pad_mode=small_pad_mode,
+                             small_pad_interpolation=small_pad_interpolation)
             + [artifact_compose]
             + _to_tensor_normalize()
         )
@@ -759,7 +804,10 @@ def get_multi_view_transforms(
     scale_state=None,
     small_pad_p: float = 0.0,
     small_crop_range: tuple = (48, 192),
+    small_pad_mode: str = "zero",
+    small_pad_interpolation: str = "random",
     moe_tracking: bool = False,
+    robust_resize_mode: str = "resize_or_crop",
 ) -> tuple:
     """Build split transforms for multi-view consistency training.
 
@@ -788,8 +836,9 @@ def get_multi_view_transforms(
         scale_state: Shared ``multiprocessing.Value('i', ...)`` for
             multi-scale training.  When provided, returns a
             :class:`_MultiscaleMultiViewWrapper`.
-        small_pad_p: Probability of small-crop+reflect-pad path.
+        small_pad_p: Probability of small-crop+pad path.
         small_crop_range: ``(min, max)`` pixel range for small crops.
+        small_pad_mode: ``"zero"`` or ``"reflect"``.
         moe_tracking: Wrap ``augment_only`` in
             :class:`TrackingTransformWrapper` for MoE training.
 
@@ -812,7 +861,10 @@ def get_multi_view_transforms(
                 scale_state=None,  # prevent recursion
                 small_pad_p=small_pad_p,
                 small_crop_range=small_crop_range,
+                small_pad_mode=small_pad_mode,
+                small_pad_interpolation=small_pad_interpolation,
                 moe_tracking=moe_tracking,
+                robust_resize_mode=robust_resize_mode,
             )
         return _MultiscaleMultiViewWrapper(
             _build_for_size, scale_state, image_size,
@@ -836,9 +888,14 @@ def get_multi_view_transforms(
             f"Multi-view not supported for augmentation={augmentation!r}. "
             f"Supported: {sorted(_SPATIAL_MAP.keys())}"
         )
+    spatial_kwargs = {"small_pad_p": small_pad_p,
+                      "small_crop_range": small_crop_range,
+                      "small_pad_mode": small_pad_mode,
+                      "small_pad_interpolation": small_pad_interpolation}
+    if spatial_fn is _robust_geometric:
+        spatial_kwargs["resize_mode"] = robust_resize_mode
     shared_spatial = T.Compose(
-        spatial_fn(image_size, small_pad_p=small_pad_p,
-                   small_crop_range=small_crop_range)
+        spatial_fn(image_size, **spatial_kwargs)
     )
 
     # ── augment_only (view-1 only) ─────────────────────────────────
@@ -850,15 +907,10 @@ def get_multi_view_transforms(
 
     if augmentation == "robust":
         artifact_compose = GroupedNOfCompose(
-            _robust_artifact_groups(), n=4,
-            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.1,
+            _robust_artifact_groups_extended(), n=7,
+            weights=_ROBUST_GROUP_WEIGHTS, clean_p=0.15,
         )
-        augment_list = (
-            [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
-            + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
-        )
-        augment_only = T.Compose(augment_list)
+        augment_only = T.Compose([artifact_compose])
         if moe_tracking:
             augment_only = TrackingTransformWrapper(
                 augment_only, group_source=artifact_compose,

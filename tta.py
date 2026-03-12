@@ -66,9 +66,17 @@ def _resize_tensor(tensor: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def _has_prep_margin(tensor: torch.Tensor, image_size: int) -> bool:
-    """Check if the tensor is larger than the model's expected input size."""
+    """Check if the tensor is larger than the model's expected input size.
+
+    Returns ``True`` when at least one spatial dimension exceeds
+    ``image_size`` and neither is smaller — i.e. a center crop can
+    safely produce an ``(image_size, image_size)`` output.  This
+    correctly handles non-square tensors produced by
+    ``ReflectPadIfSmaller`` when one original dimension was below
+    ``image_size``.
+    """
     _, _, h, w = tensor.shape
-    return h > image_size and w > image_size
+    return h >= image_size and w >= image_size and (h > image_size or w > image_size)
 
 
 # ═══════════════════════════════════════════════════════════════════

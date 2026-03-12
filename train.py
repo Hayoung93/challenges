@@ -1330,11 +1330,13 @@ def main():
         print_rank0(f"  LoRA-MoE expert params: {lora_moe_params:,}", args)
 
     # VRAM pre-check: simulate actual training memory with all active options
-    if device.type == "cuda":
+    if device.type == "cuda" and not getattr(args, "no_vram_precheck", False):
         check_size = args.image_size
         if getattr(args, "multiscale", False):
             check_size = max(args.multiscale_sizes)
         vram_precheck(model, check_size, args.batch_size, device, args.amp, args)
+    elif getattr(args, "no_vram_precheck", False):
+        print_rank0("  VRAM pre-check: SKIPPED (--no_vram_precheck)", args)
 
     # Linear LR scaling (before optimizer build)
     if args.distributed and getattr(args, "scale_lr", False):

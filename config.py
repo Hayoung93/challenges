@@ -39,8 +39,13 @@ DEFAULTS = {
     "curriculum_n_max_start": 1,  # upper bound at epoch 0
     "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
-    # Small-crop reflect-pad augmentation (simulates tiny test images)
-    "small_pad_p": 0.1,
+    # Robust geometric resize mode
+    "robust_resize_mode": "resize_or_crop",  # "resize_or_crop" or "resize"
+
+    # Small-crop pad augmentation (simulates tiny test images)
+    "small_pad_p": 0.0,
+    "small_pad_mode": "zero",  # "zero", "reflect", or "resize"
+    "small_pad_interpolation": "random",  # "random", "bilinear", "lanczos", "nearest"
     "small_crop_range_min": 48,
     "small_crop_range_max": 192,
 
@@ -231,10 +236,27 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=DEFAULTS["curriculum_n_max_end"],
                     help="Upper bound of group count at curriculum completion "
                          "(used by robust_curriculum_range)")
+    g.add_argument("--robust_resize_mode", type=str,
+                    default=DEFAULTS["robust_resize_mode"],
+                    choices=["resize_or_crop", "resize"],
+                    help="Geometric resize mode for robust augmentation: "
+                         "'resize_or_crop' (RandomResizeOrCrop, preserves pixel artifacts) "
+                         "or 'resize' (Resize+CenterCrop, no random cropping)")
     g.add_argument("--small_pad_p", type=float,
                     default=DEFAULTS["small_pad_p"],
                     help="Probability of small-crop+reflect-pad augmentation "
                          "during training (0.0 = disabled, 0.1 recommended)")
+    g.add_argument("--small_pad_mode", type=str,
+                    default=DEFAULTS["small_pad_mode"],
+                    choices=["zero", "reflect", "resize"],
+                    help="Padding mode for small-crop augmentation: "
+                         "'zero' (constant 0 padding), 'reflect' (mirror padding), "
+                         "or 'resize' (interpolate small crop to target size)")
+    g.add_argument("--small_pad_interpolation", type=str,
+                    default=DEFAULTS["small_pad_interpolation"],
+                    choices=["random", "bilinear", "bicubic", "lanczos", "nearest"],
+                    help="Interpolation for small_pad_mode='resize': "
+                         "'random' (randomly pick each time), or a fixed method")
     g.add_argument("--small_crop_range_min", type=int,
                     default=DEFAULTS["small_crop_range_min"],
                     help="Minimum crop size for small-pad augmentation")
@@ -500,6 +522,10 @@ def add_train_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--mvc_ema_decay", type=float,
                     default=DEFAULTS["mvc_ema_decay"],
                     help="EMA decay rate for teacher model (0.999 typical)")
+    # VRAM pre-check control
+    g.add_argument("--no_vram_precheck", action="store_true", default=False,
+                    help="Skip VRAM pre-check before training "
+                         "(useful when the check itself is too heavy)")
     return parser
 
 
