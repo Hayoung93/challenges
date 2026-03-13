@@ -352,7 +352,9 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
         small_crop_range: ``(min, max)`` pixel range for small crops.
         resize_mode: ``"resize_or_crop"`` uses :class:`RandomResizeOrCrop`
             (pixel-preserving crop path); ``"resize"`` uses
-            ``Resize`` + ``CenterCrop`` (deterministic sizing).
+            ``Resize`` + ``CenterCrop`` (deterministic sizing);
+            ``"crop_only"`` always random-crops without any resize
+            (zero-pads if the image is smaller than *image_size*).
         small_pad_mode: ``"zero"``, ``"reflect"``, or ``"resize"``.
         small_pad_interpolation: Interpolation for ``"resize"`` mode.
     """
@@ -361,6 +363,11 @@ def _robust_geometric(image_size: int, crop_p: float = 0.5,
             T.Resize(image_size),
             T.CenterCrop(image_size),
         ])
+    elif resize_mode == "crop_only":
+        first_transform = RandomResizeOrCrop(
+            image_size, crop_p=1.0, scale=(0.5, 1.0),
+            padding_mode="constant",
+        )
     elif small_pad_p > 0:
         first_transform = ResizeOrCropWithSmallPad(
             image_size, crop_p=crop_p, scale=(0.5, 1.0),

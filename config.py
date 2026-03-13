@@ -40,7 +40,7 @@ DEFAULTS = {
     "curriculum_n_max_end": 7,    # upper bound at curriculum completion
 
     # Robust geometric resize mode
-    "robust_resize_mode": "resize_or_crop",  # "resize_or_crop" or "resize"
+    "robust_resize_mode": "resize_or_crop",  # "resize_or_crop", "resize", or "crop_only"
 
     # Small-crop pad augmentation (simulates tiny test images)
     "small_pad_p": 0.0,
@@ -238,10 +238,11 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "(used by robust_curriculum_range)")
     g.add_argument("--robust_resize_mode", type=str,
                     default=DEFAULTS["robust_resize_mode"],
-                    choices=["resize_or_crop", "resize"],
+                    choices=["resize_or_crop", "resize", "crop_only"],
                     help="Geometric resize mode for robust augmentation: "
-                         "'resize_or_crop' (RandomResizeOrCrop, preserves pixel artifacts) "
-                         "or 'resize' (Resize+CenterCrop, no random cropping)")
+                         "'resize_or_crop' (RandomResizeOrCrop, preserves pixel artifacts), "
+                         "'resize' (Resize+CenterCrop, no random cropping), or "
+                         "'crop_only' (random crop only, zero-pad if smaller than input size, no resize)")
     g.add_argument("--small_pad_p", type=float,
                     default=DEFAULTS["small_pad_p"],
                     help="Probability of small-crop+reflect-pad augmentation "
