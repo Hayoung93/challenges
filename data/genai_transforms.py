@@ -1778,6 +1778,142 @@ class RandomDCTBasisOverlay:
         )
 
 
+# ---- DCT-II orthonormal basis matrix (8x8) for RandomDCTQuantization ----
+
+def _build_dct8_matrix():
+    """Build 8x8 DCT-II orthonormal basis matrix."""
+    D = np.zeros((8, 8), dtype=np.float32)
+    for k in range(8):
+        for i in range(8):
+            D[k, i] = math.cos(math.pi * k * (2 * i + 1) / 16)
+        D[k] *= math.sqrt(2 / 8) if k > 0 else math.sqrt(1 / 8)
+    return D
+
+
+_DCT8_NP = _build_dct8_matrix()
+
+# High-frequency DCT basis candidates producing visible 8x8 block patterns.
+_HF_BASIS = [
+    (0, 5), (0, 6), (0, 7),          # vertical stripes (fine)
+    (5, 0), (6, 0), (7, 0),          # horizontal stripes (fine)
+    (4, 4), (5, 5), (6, 6), (7, 7),  # checkerboard (coarse -> fine)
+    (3, 5), (5, 3),                   # diagonal patterns
+    (2, 6), (6, 2),                   # diagonal patterns
+    (4, 6), (6, 4),                   # mixed
+    (3, 7), (7, 3),                   # near-axis stripes
+]
+
+
+class RandomDCTQuantization:
+    """Inject structured 8x8 DCT block artifacts (stripes/checkerboard/diagonal).
+
+    Each 8x8 block receives 1-2 randomly chosen high-frequency DCT basis
+    patterns from a curated set of 18 candidates, creating visible structured
+    artifacts: vertical stripes, horizontal stripes, checkerboard, diagonal, etc.
+
+    Key differences from :class:`RandomDCTBasisOverlay`:
+
+    - **Luminance-only**: applies delta to Y channel only (no chromatic noise).
+    - **Curated 18 basis set**: targets the specific high-frequency patterns
+      observed in real test-set images (``6ca585de`` etc.).
+    - **All blocks affected**: uniform application across flat and textured
+      regions (textured areas naturally absorb the pattern).
+
+    Supports the ``_intensity`` protocol for curriculum scheduling.
+
+    Args:
+        strength_range: ``(min, max)`` amplitude of injected DCT coefficients.
+        p: Probability of applying this transform.
+    """
+
+    def __init__(self, strength_range=(2.0, 18.0), p=1.0):
+        self.strength_range = strength_range
+        self.p = p
+        self._intensity = 1.0
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+
+        w, h = img.size
+        n_bx = w // 8
+        n_by = h // 8
+        if n_bx == 0 or n_by == 0:
+            return img
+
+        arr = np.array(img, dtype=np.float32)  # [H, W, 3]
+
+        # Intensity-scaled strength
+        lo, hi = _iscale_upper(self.strength_range, self._intensity)
+        strength = random.uniform(lo, hi)
+
+        # Extract luminance (BT.601)
+        Y = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+
+        # Crop to 8-aligned region
+        crop_h = n_by * 8
+        crop_w = n_bx * 8
+        Y_crop = Y[:crop_h, :crop_w]  # [crop_h, crop_w]
+
+        D = _DCT8_NP
+        Dt = D.T
+        n_blocks = n_bx * n_by
+
+        # Reshape into blocks [n_blocks, 8, 8]
+        blocks = (Y_crop.reshape(n_by, 8, n_bx, 8)
+                  .transpose(0, 2, 1, 3)
+                  .reshape(n_blocks, 8, 8))
+
+        # Forward DCT
+        shifted = blocks - 128.0
+        coeffs = D @ shifted @ Dt
+
+        # Inject 1-2 random high-frequency basis patterns per block
+        n_basis = len(_HF_BASIS)
+        pattern = np.zeros_like(coeffs)  # [n_blocks, 8, 8]
+
+        idx1 = np.random.randint(0, n_basis, size=n_blocks)
+        idx2 = np.random.randint(0, n_basis, size=n_blocks)
+        sign1 = (np.random.randint(0, 2, size=n_blocks) * 2 - 1).astype(np.float32)
+        sign2 = (np.random.randint(0, 2, size=n_blocks) * 2 - 1).astype(np.float32)
+        amp = (0.5 + np.random.rand(n_blocks)).astype(np.float32)  # [0.5, 1.5]
+
+        base_amp = strength * 30.0
+        block_idx = np.arange(n_blocks)
+
+        basis_arr = np.array(_HF_BASIS)  # [n_basis, 2]
+        i1 = basis_arr[idx1, 0]
+        j1 = basis_arr[idx1, 1]
+        pattern[block_idx, i1, j1] = sign1 * base_amp * amp
+
+        i2 = basis_arr[idx2, 0]
+        j2 = basis_arr[idx2, 1]
+        pattern[block_idx, i2, j2] += sign2 * base_amp * amp * 0.6
+
+        coeffs = coeffs + pattern
+
+        # Inverse DCT
+        recon = Dt @ coeffs @ D + 128.0
+
+        # Reassemble
+        Y_new = (recon.reshape(n_by, n_bx, 8, 8)
+                 .transpose(0, 2, 1, 3)
+                 .reshape(crop_h, crop_w))
+
+        # Apply luminance delta to RGB (preserves color)
+        delta = Y_new - Y_crop
+        arr[:crop_h, :crop_w, :] += delta[:, :, np.newaxis]
+        np.clip(arr, 0, 255, out=arr)
+        return Image.fromarray(arr.astype(np.uint8))
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"strength_range={self.strength_range}, "
+            f"p={self.p})"
+        )
+
+
 class RandomMoire:
     """Apply moire-pattern augmentation via sine-wave synthesis or real pattern blending.
 

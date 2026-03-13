@@ -12,6 +12,7 @@ from .genai_transforms import (
     SkipIfClean,
     RandomBoxBlur,
     RandomDCTBasisOverlay,
+    RandomDCTQuantization,
     RandomMoire,
     RandomBrightnessCurve,
     RandomChromaNoise,
@@ -435,6 +436,11 @@ def _robust_artifact_groups() -> dict:
             RandomContrastCurve(amount_range=(-0.4, 0.3), p=1.0),
             RandomBrightnessCurve(amount_range=(-0.4, 0.5), p=1.0),
         ],
+        "block_artifact": [
+            (RandomDCTQuantization(strength_range=(2.0, 18.0), p=1.0), 0.8),
+            (RandomDCTBasisOverlay(strength_range=(5.0, 40.0), n_basis_range=(1, 3),
+                                   block_coverage=0.3, p=1.0), 0.2),
+        ],
     }
 
 
@@ -494,6 +500,11 @@ def _robust_artifact_groups_extended() -> dict:
         "moire": [
             RandomMoire(p=1.0),
         ],
+        # "block_artifact": [
+        #     (RandomDCTQuantization(strength_range=(2.0, 18.0), p=1.0), 0.8),
+        #     (RandomDCTBasisOverlay(strength_range=(5.0, 40.0), n_basis_range=(1, 3),
+        #                            block_coverage=0.3, p=1.0), 0.2),
+        # ],
     }
 
 
@@ -503,7 +514,8 @@ _ROBUST_GROUP_WEIGHTS = {
     "color": 0.4,
     "spatial": 0.5,
     "sharpness_brightness": 0.5,
-    "moire": 0.5,
+    "moire": 0.7,
+    "block_artifact": 0.7,
 }
 
 
@@ -758,7 +770,6 @@ def get_train_transform(
                               small_pad_mode=small_pad_mode,
                              small_pad_interpolation=small_pad_interpolation)
             + [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
             + _to_tensor_normalize()
         )
@@ -941,7 +952,6 @@ def get_multi_view_transforms(
         )
         augment_list = (
             [artifact_compose]
-            + [SkipIfClean(artifact_compose, RandomDCTBasisOverlay(p=0.05))]
             + [SkipIfClean(artifact_compose, RandomMoire(p=0.05))]
         )
         augment_only = T.Compose(augment_list)
