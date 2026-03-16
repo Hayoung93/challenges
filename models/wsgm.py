@@ -1,8 +1,15 @@
-"""WSGM (Weighted Side Gating Module) wrapper for DINOv3 backbones.
+"""WSGM (Weighted Side Gating Module) wrappers for DINOv3 backbones.
 
-Provides a unified adapter that wraps DINOv3 ViT or ConvNeXt backbones
-with lightweight WSGM modules for forgery-specific feature learning.
-Follows the same integration pattern as ``models/lora.py``.
+Provides two WSGM integration modes:
+
+- **Post-extraction** (``WSGMWrapper``): Applies WSGM to CLS tokens
+  extracted from selected intermediate layers via ``get_intermediate_layers``.
+- **Inline injection** (``InlineWSGMWrapper``): Injects WSGM residually
+  into *every* transformer block, modifying all tokens (CLS + patches)
+  so that adapted features cascade through subsequent blocks.  Based on
+  the DFD-NDC / ForgeLens Stage 1 architecture.
+
+Both follow the same integration pattern as ``models/lora.py``.
 """
 
 from typing import List
@@ -331,6 +338,259 @@ class WSGMWrapper(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# AttentionPooling
+# ---------------------------------------------------------------------------
+
+class AttentionPooling(nn.Module):
+    """Cross-attention pooling with a learnable query token.
+
+    A single learnable query attends to all patch tokens via multi-head
+    attention, producing one pooled vector.  Used by
+    :class:`InlineWSGMWrapper` when ``pooling_type="attn"``.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int = 8, attn_drop: float = 0.1):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=attn_drop,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        """Pool patch tokens into a single vector.
+
+        Args:
+            patch_tokens: ``(B, N, D)`` float32 patch token features.
+
+        Returns:
+            Pooled vector of shape ``(B, D)``.
+        """
+        B = patch_tokens.size(0)
+        query = self.query.expand(B, -1, -1)  # (B, 1, D)
+        pooled, _ = self.attn(
+            query=query, key=patch_tokens, value=patch_tokens,
+            need_weights=False,
+        )
+        return self.norm(pooled.squeeze(1))  # (B, D)
+
+
+# ---------------------------------------------------------------------------
+# InlineWSGMWrapper
+# ---------------------------------------------------------------------------
+
+class InlineWSGMWrapper(nn.Module):
+    """DFD-NDC / ForgeLens-style inline WSGM injection for DINOv3 ViT.
+
+    Unlike :class:`WSGMWrapper` which applies WSGM only to extracted CLS
+    tokens, this wrapper manually iterates through every transformer block
+    and applies WSGM residually to **all** tokens (CLS + patches + storage).
+    Modified features cascade into subsequent blocks, enabling richer
+    forgery-specific adaptation.
+
+    Classification uses CLS token concatenated with pooled patch tokens
+    (GAP or Attention Pooling), producing a ``2 * embed_dim`` feature
+    before the head.
+
+    Args:
+        backbone: Pre-initialised DINOv3 ViT backbone.
+        model_name: Identifier (e.g. ``"dinov3_vitl16"``).
+        num_classes: Output classes (default 2).
+        reduction_factor: Bottleneck = ``embed_dim // reduction_factor``.
+        dropout: Dropout in WSGM modules and classifier.
+        num_wsgm: Number of WSGM modules.  ``0`` = auto (``n_blocks // 2``).
+        pooling_type: ``"gap"`` (mean pooling) or ``"attn"`` (attention pooling).
+        attn_heads: Number of heads for ``AttentionPooling``.
+        attn_drop: Dropout for ``AttentionPooling``.
+        use_bfloat16: Permanently cast frozen backbone to bfloat16.
+        freeze_backbone: Freeze backbone weights (default True).
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        model_name: str,
+        num_classes: int = 2,
+        reduction_factor: int = 4,
+        dropout: float = 0.5,
+        num_wsgm: int = 0,
+        pooling_type: str = "gap",
+        attn_heads: int = 8,
+        attn_drop: float = 0.1,
+        use_bfloat16: bool = True,
+        freeze_backbone: bool = True,
+    ):
+        super().__init__()
+
+        # Validate: inline mode requires ViT (needs blocks, prepare_tokens_with_masks)
+        if not hasattr(backbone, "blocks"):
+            raise ValueError(
+                "InlineWSGMWrapper requires a ViT backbone with 'blocks' attribute. "
+                "ConvNeXt models are not supported — use WSGMWrapper instead."
+            )
+
+        self.backbone = backbone
+        self.model_name = model_name
+        self.num_classes = num_classes
+        self.pooling_type = pooling_type
+        self.use_bfloat16 = use_bfloat16
+
+        self.num_blocks = backbone.n_blocks
+        self._backbone_embed_dim = backbone.embed_dim
+        self.n_storage_tokens = getattr(backbone, "n_storage_tokens", 0)
+
+        # Auto-determine num_wsgm
+        self.num_wsgm = num_wsgm if num_wsgm > 0 else max(self.num_blocks // 2, 1)
+
+        # Freeze backbone
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Optional bfloat16 cast for frozen backbone
+        if use_bfloat16:
+            self.backbone = self.backbone.to(torch.bfloat16)
+
+        # Trainable WSGM modules (float32)
+        bottleneck = max(self._backbone_embed_dim // reduction_factor, 1)
+        self.wsgm_modules = nn.ModuleList([
+            WSGM(self._backbone_embed_dim, bottleneck, dropout_prob=dropout)
+            for _ in range(self.num_wsgm)
+        ])
+
+        # Attention pooling (optional)
+        if pooling_type == "attn":
+            self.attn_pool = AttentionPooling(
+                self._backbone_embed_dim, num_heads=attn_heads, attn_drop=attn_drop,
+            )
+
+        # Head: CLS + pooled → 2 * embed_dim
+        head_dim = self._backbone_embed_dim * 2
+        self.final_dim = head_dim
+        self.ln_post = nn.LayerNorm(head_dim)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(head_dim, num_classes),
+        )
+        nn.init.normal_(self.classifier[1].weight, mean=0.0, std=0.02)
+        nn.init.constant_(self.classifier[1].bias, 0)
+
+    # ------------------------------------------------------------------
+    # ForgeLens block-to-WSGM mapping
+    # ------------------------------------------------------------------
+
+    def _get_wsgm_idx(self, block_idx: int) -> int:
+        """Map transformer block index to WSGM module index."""
+        return (block_idx * self.num_wsgm) // self.num_blocks
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def _forward_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run backbone blocks with inline WSGM injection.
+
+        Returns:
+            ``(cls_token, pooled)`` both as float32, each ``(B, embed_dim)``.
+        """
+        if self.use_bfloat16:
+            x = x.to(torch.bfloat16)
+
+        x, (H, W) = self.backbone.prepare_tokens_with_masks(x)
+        rope = self.backbone.rope_embed(H=H, W=W)
+
+        for i, blk in enumerate(self.backbone.blocks):
+            x = blk(x, rope)
+            wsgm_idx = self._get_wsgm_idx(i)
+            wsgm_out = self.wsgm_modules[wsgm_idx](x.float())
+            if self.use_bfloat16:
+                x = x + wsgm_out.to(torch.bfloat16)
+            else:
+                x = x + wsgm_out
+
+        # Final norm — handle untie_cls_and_patch_norms
+        if getattr(self.backbone, "untie_cls_and_patch_norms", False):
+            x_cls_reg = self.backbone.cls_norm(
+                x[:, : self.n_storage_tokens + 1]
+            )
+            x_patch = self.backbone.norm(
+                x[:, self.n_storage_tokens + 1:]
+            )
+        else:
+            x_norm = self.backbone.norm(x)
+            x_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
+            x_patch = x_norm[:, self.n_storage_tokens + 1:]
+
+        cls_token = x_cls_reg[:, 0].float()       # (B, D)
+        patch_tokens = x_patch.float()             # (B, N_patches, D)
+
+        # Pool patch tokens
+        if self.pooling_type == "attn":
+            pooled = self.attn_pool(patch_tokens)  # (B, D)
+        else:
+            pooled = patch_tokens.mean(dim=1)      # (B, D)
+
+        return cls_token, pooled
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cls_token, pooled = self._forward_features(x)
+        features = torch.cat([cls_token, pooled], dim=1)  # (B, 2*D)
+        features = self.ln_post(features)
+        return self.classifier(features)
+
+    def forward_with_embedding(self, x: torch.Tensor) -> tuple:
+        """Forward pass returning both logits and pre-classifier embedding.
+
+        Returns:
+            ``(logits, embedding)`` where embedding has shape ``(B, 2*embed_dim)``.
+        """
+        cls_token, pooled = self._forward_features(x)
+        embedding = torch.cat([cls_token, pooled], dim=1)
+        embedding = self.ln_post(embedding)
+        logits = self.classifier(embedding)
+        return logits, embedding
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def embed_dim(self) -> int:
+        return self.final_dim
+
+    @property
+    def head(self) -> nn.Linear:
+        """Expose the classifier Linear for compatibility with GenAIClassifier."""
+        return self.classifier[1]
+
+    @head.setter
+    def head(self, value: nn.Module):
+        self.classifier[1] = value
+
+    def print_config(self):
+        backbone_frozen = not any(
+            p.requires_grad for p in self.backbone.parameters()
+        )
+        print(f"\nInlineWSGMWrapper Configuration:")
+        print(f"  Backbone: {self.model_name}")
+        print(f"  Backbone frozen: {backbone_frozen}")
+        print(f"  Backbone dtype: {'bfloat16' if self.use_bfloat16 else 'float32'}")
+        print(f"  WSGM modules: {self.num_wsgm} (across {self.num_blocks} blocks)")
+        print(f"  Pooling: {self.pooling_type}")
+        print(f"  Feature dim: {self.final_dim} (CLS + pooled)")
+        print(f"  Classes: {self.num_classes}")
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"\n  Trainable params: {trainable:,}")
+        print(f"  Frozen params: {total - trainable:,}")
+        print(f"  Trainable ratio: {100 * trainable / total:.2f}%")
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 
@@ -347,13 +607,13 @@ def count_wsgm_params(model: nn.Module) -> tuple[int, int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Find the WSGMWrapper inside the model
+    # Find the WSGMWrapper or InlineWSGMWrapper inside the model
     wrapper = None
-    if isinstance(model, WSGMWrapper):
+    if isinstance(model, (WSGMWrapper, InlineWSGMWrapper)):
         wrapper = model
     else:
         for m in model.modules():
-            if isinstance(m, WSGMWrapper):
+            if isinstance(m, (WSGMWrapper, InlineWSGMWrapper)):
                 wrapper = m
                 break
 
@@ -363,12 +623,15 @@ def count_wsgm_params(model: nn.Module) -> tuple[int, int, int]:
     wsgm_params = 0
     # WSGM modules
     wsgm_params += sum(p.numel() for p in wrapper.wsgm_modules.parameters())
-    # Stage projections (ConvNeXt)
-    if wrapper.stage_projections is not None:
+    # Stage projections (ConvNeXt, WSGMWrapper only)
+    if getattr(wrapper, "stage_projections", None) is not None:
         wsgm_params += sum(p.numel() for p in wrapper.stage_projections.parameters())
     # Concat projection (if concat mode)
     if hasattr(wrapper, "concat_proj"):
         wsgm_params += sum(p.numel() for p in wrapper.concat_proj.parameters())
+    # Attention pooling (InlineWSGMWrapper)
+    if hasattr(wrapper, "attn_pool"):
+        wsgm_params += sum(p.numel() for p in wrapper.attn_pool.parameters())
     # Post LayerNorm
     wsgm_params += sum(p.numel() for p in wrapper.ln_post.parameters())
     # Classifier

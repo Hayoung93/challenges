@@ -90,9 +90,15 @@ DEFAULTS = {
 
     # WSGM
     "wsgm": False,
+    "wsgm_mode": "post",           # "post" (CLS-only extraction) or "inline" (all-token injection)
     "wsgm_reduction_factor": 4,
     "wsgm_dropout": 0.5,
-    "wsgm_aggregation": "average",  # "average" or "concat"
+    "wsgm_aggregation": "average",  # "average" or "concat" (post mode only)
+    "wsgm_num_modules": 0,         # 0 = auto (n_blocks // 2)
+    "wsgm_pooling": "gap",         # "gap" or "attn" (inline mode only)
+    "wsgm_attn_heads": 8,          # AttentionPooling num_heads (inline + attn)
+    "wsgm_attn_drop": 0.1,         # AttentionPooling dropout (inline + attn)
+    "wsgm_use_bfloat16": True,     # cast frozen backbone to bfloat16 (inline mode)
 
     # Mixture of Experts
     "moe_enabled": False,
@@ -368,7 +374,29 @@ def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--wsgm_aggregation", type=str,
                     default=DEFAULTS["wsgm_aggregation"],
                     choices=["average", "concat"],
-                    help="WSGM output aggregation mode")
+                    help="WSGM output aggregation mode (post mode only)")
+    g.add_argument("--wsgm_mode", type=str,
+                    default=DEFAULTS["wsgm_mode"],
+                    choices=["post", "inline"],
+                    help="WSGM mode: 'post' (CLS extraction) or 'inline' (all-token injection)")
+    g.add_argument("--wsgm_num_modules", type=int,
+                    default=DEFAULTS["wsgm_num_modules"],
+                    help="Number of WSGM modules (0 = auto: n_blocks // 2)")
+    g.add_argument("--wsgm_pooling", type=str,
+                    default=DEFAULTS["wsgm_pooling"],
+                    choices=["gap", "attn"],
+                    help="Patch pooling type for inline WSGM: 'gap' or 'attn'")
+    g.add_argument("--wsgm_attn_heads", type=int,
+                    default=DEFAULTS["wsgm_attn_heads"],
+                    help="Number of attention heads for AttentionPooling")
+    g.add_argument("--wsgm_attn_drop", type=float,
+                    default=DEFAULTS["wsgm_attn_drop"],
+                    help="Dropout for AttentionPooling")
+    g.add_argument("--wsgm_use_bfloat16", action="store_true",
+                    default=DEFAULTS["wsgm_use_bfloat16"],
+                    help="Cast frozen backbone to bfloat16 (inline mode)")
+    g.add_argument("--no_wsgm_use_bfloat16", dest="wsgm_use_bfloat16",
+                    action="store_false")
     g.add_argument("--moe_enabled", action="store_true",
                     default=DEFAULTS["moe_enabled"],
                     help="Enable Mixture of Experts classification heads "
@@ -649,4 +677,14 @@ def merge_config(args: argparse.Namespace) -> argparse.Namespace:
                 f"--lora_moe_enabled requires --augmentation robust/"
                 f"robust_curriculum/robust_curriculum_range, got '{aug}'"
             )
+
+    # Inline WSGM requires DINOv3 ViT (not ConvNeXt).
+    if getattr(args, "wsgm", False) and getattr(args, "wsgm_mode", "post") == "inline":
+        model = getattr(args, "model_name", "")
+        if not model.startswith("dinov3_vit"):
+            raise ValueError(
+                f"--wsgm_mode inline requires a DINOv3 ViT model "
+                f"(dinov3_vit*), got '{model}'"
+            )
+
     return args

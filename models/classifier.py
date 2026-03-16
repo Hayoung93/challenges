@@ -194,9 +194,15 @@ class GenAIClassifier(nn.Module):
         convlora_alpha: float = 4.0,
         convlora_dropout: float = 0.0,
         wsgm: bool = False,
+        wsgm_mode: str = "post",
         wsgm_reduction_factor: int = 4,
         wsgm_dropout: float = 0.5,
         wsgm_aggregation: str = "average",
+        wsgm_num_modules: int = 0,
+        wsgm_pooling: str = "gap",
+        wsgm_attn_heads: int = 8,
+        wsgm_attn_drop: float = 0.1,
+        wsgm_use_bfloat16: bool = True,
         projection_dim: int = 0,
         moe_enabled: bool = False,
         lora_moe_enabled: bool = False,
@@ -271,17 +277,39 @@ class GenAIClassifier(nn.Module):
         if wsgm:
             if model_name not in _DINOV3_WEIGHTS:
                 raise ValueError("WSGM is only supported for DINOv3 models")
-            from .wsgm import WSGMWrapper
 
-            self.backbone = WSGMWrapper(
-                backbone=self.backbone,
-                model_name=model_name,
-                num_classes=num_classes,
-                reduction_factor=wsgm_reduction_factor,
-                dropout=wsgm_dropout,
-                aggregation=wsgm_aggregation,
-                freeze_backbone=freeze_backbone,
-            )
+            if wsgm_mode == "inline":
+                if not model_name.startswith("dinov3_vit"):
+                    raise ValueError(
+                        "Inline WSGM mode requires DINOv3 ViT models (not ConvNeXt)"
+                    )
+                from .wsgm import InlineWSGMWrapper
+
+                self.backbone = InlineWSGMWrapper(
+                    backbone=self.backbone,
+                    model_name=model_name,
+                    num_classes=num_classes,
+                    reduction_factor=wsgm_reduction_factor,
+                    dropout=wsgm_dropout,
+                    num_wsgm=wsgm_num_modules,
+                    pooling_type=wsgm_pooling,
+                    attn_heads=wsgm_attn_heads,
+                    attn_drop=wsgm_attn_drop,
+                    use_bfloat16=wsgm_use_bfloat16,
+                    freeze_backbone=freeze_backbone,
+                )
+            else:
+                from .wsgm import WSGMWrapper
+
+                self.backbone = WSGMWrapper(
+                    backbone=self.backbone,
+                    model_name=model_name,
+                    num_classes=num_classes,
+                    reduction_factor=wsgm_reduction_factor,
+                    dropout=wsgm_dropout,
+                    aggregation=wsgm_aggregation,
+                    freeze_backbone=freeze_backbone,
+                )
         else:
             # Replace the classification head for our target num_classes.
             if moe_enabled:
@@ -694,9 +722,15 @@ def build_model(args) -> GenAIClassifier:
         convlora_alpha=getattr(args, "convlora_alpha", 4.0),
         convlora_dropout=getattr(args, "convlora_dropout", 0.0),
         wsgm=getattr(args, "wsgm", False),
+        wsgm_mode=getattr(args, "wsgm_mode", "post"),
         wsgm_reduction_factor=getattr(args, "wsgm_reduction_factor", 4),
         wsgm_dropout=getattr(args, "wsgm_dropout", 0.5),
         wsgm_aggregation=getattr(args, "wsgm_aggregation", "average"),
+        wsgm_num_modules=getattr(args, "wsgm_num_modules", 0),
+        wsgm_pooling=getattr(args, "wsgm_pooling", "gap"),
+        wsgm_attn_heads=getattr(args, "wsgm_attn_heads", 8),
+        wsgm_attn_drop=getattr(args, "wsgm_attn_drop", 0.1),
+        wsgm_use_bfloat16=getattr(args, "wsgm_use_bfloat16", True),
         projection_dim=getattr(args, "projection_dim", 0),
         moe_enabled=getattr(args, "moe_enabled", False),
         lora_moe_enabled=getattr(args, "lora_moe_enabled", False),
