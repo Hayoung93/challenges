@@ -493,45 +493,54 @@ class InlineWSGMWrapper(nn.Module):
     def _forward_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Run backbone blocks with inline WSGM injection.
 
+        When ``use_bfloat16=True``, precision is managed manually
+        (backbone bf16, WSGM fp32).  ``torch.amp.autocast`` is disabled
+        inside this method to prevent conflicts — the same strategy used
+        by the DFD-NDC reference implementation.
+
         Returns:
             ``(cls_token, pooled)`` both as float32, each ``(B, embed_dim)``.
         """
-        if self.use_bfloat16:
-            x = x.to(torch.bfloat16)
-
-        x, (H, W) = self.backbone.prepare_tokens_with_masks(x)
-        rope = self.backbone.rope_embed(H=H, W=W)
-
-        for i, blk in enumerate(self.backbone.blocks):
-            x = blk(x, rope)
-            wsgm_idx = self._get_wsgm_idx(i)
-            wsgm_out = self.wsgm_modules[wsgm_idx](x.float())
+        # Disable autocast: we manage bf16/fp32 precision manually.
+        # autocast + permanent bfloat16 backbone causes NaN gradients
+        # (same issue as DFD_NDC with nn.DataParallel).
+        with torch.amp.autocast(device_type="cuda", enabled=False):
             if self.use_bfloat16:
-                x = x + wsgm_out.to(torch.bfloat16)
+                x = x.to(torch.bfloat16)
+
+            x, (H, W) = self.backbone.prepare_tokens_with_masks(x)
+            rope = self.backbone.rope_embed(H=H, W=W)
+
+            for i, blk in enumerate(self.backbone.blocks):
+                x = blk(x, rope)
+                wsgm_idx = self._get_wsgm_idx(i)
+                wsgm_out = self.wsgm_modules[wsgm_idx](x.float())
+                if self.use_bfloat16:
+                    x = x + wsgm_out.to(torch.bfloat16)
+                else:
+                    x = x + wsgm_out
+
+            # Final norm — handle untie_cls_and_patch_norms
+            if getattr(self.backbone, "untie_cls_and_patch_norms", False):
+                x_cls_reg = self.backbone.cls_norm(
+                    x[:, : self.n_storage_tokens + 1]
+                )
+                x_patch = self.backbone.norm(
+                    x[:, self.n_storage_tokens + 1:]
+                )
             else:
-                x = x + wsgm_out
+                x_norm = self.backbone.norm(x)
+                x_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
+                x_patch = x_norm[:, self.n_storage_tokens + 1:]
 
-        # Final norm — handle untie_cls_and_patch_norms
-        if getattr(self.backbone, "untie_cls_and_patch_norms", False):
-            x_cls_reg = self.backbone.cls_norm(
-                x[:, : self.n_storage_tokens + 1]
-            )
-            x_patch = self.backbone.norm(
-                x[:, self.n_storage_tokens + 1:]
-            )
-        else:
-            x_norm = self.backbone.norm(x)
-            x_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
-            x_patch = x_norm[:, self.n_storage_tokens + 1:]
+            cls_token = x_cls_reg[:, 0].float()       # (B, D)
+            patch_tokens = x_patch.float()             # (B, N_patches, D)
 
-        cls_token = x_cls_reg[:, 0].float()       # (B, D)
-        patch_tokens = x_patch.float()             # (B, N_patches, D)
-
-        # Pool patch tokens
-        if self.pooling_type == "attn":
-            pooled = self.attn_pool(patch_tokens)  # (B, D)
-        else:
-            pooled = patch_tokens.mean(dim=1)      # (B, D)
+            # Pool patch tokens
+            if self.pooling_type == "attn":
+                pooled = self.attn_pool(patch_tokens)  # (B, D)
+            else:
+                pooled = patch_tokens.mean(dim=1)      # (B, D)
 
         return cls_token, pooled
 
